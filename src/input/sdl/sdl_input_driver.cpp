@@ -497,6 +497,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     // The pad can be removed between the event being posted and drained.
     return;
   }
+  REXLOG_INFO("[HALO3_INPUT_PROBE] axis={} value={} instance={}",
+              static_cast<int>(event.gaxis.axis), static_cast<int>(event.gaxis.value),
+              static_cast<int>(event.gaxis.which));
   auto& pad = controllers_.at(*idx).state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
@@ -565,6 +568,9 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     // The pad can be removed between the event being posted and drained.
     return;
   }
+  REXLOG_INFO("[HALO3_INPUT_PROBE] button={} down={} instance={}",
+              static_cast<int>(event.gbutton.button), event.gbutton.down ? 1 : 0,
+              static_cast<int>(event.gbutton.which));
   auto& controller = controllers_.at(*idx);
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
