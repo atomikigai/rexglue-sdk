@@ -33,9 +33,13 @@
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
 
+REXCVAR_DEFINE_INT32(display_gamma_type, 2, "Display",
+                     "Display transfer function reported to the guest (0 = linear, 1 = sRGB, "
+                     "2 = BT.709, 3 = custom power)")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace {
-// Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
-constexpr uint32_t kDisplayGammaType = 2;
 // Display gamma power (used with gamma type 3)
 constexpr double kDisplayGammaPower = 2.22222233;
 
@@ -153,7 +157,7 @@ void VdGetCurrentDisplayGamma_entry(mapped_u32 type_ptr, mapped_f32 power_ptr) {
   // 3 - use the power written to *power_ptr.
   // Anything else - linear.
   // Used in D3D SetGammaRamp/SetPWLGamma to adjust the ramp for the display.
-  *type_ptr = kDisplayGammaType;
+  *type_ptr = uint32_t(REXCVAR_GET(display_gamma_type));
   *power_ptr = float(kDisplayGammaPower);
 }
 

@@ -69,6 +69,10 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "device (falls back to render passes otherwise)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_log_gamma_ramp, false, "GPU/Vulkan",
+                    "Log the display gamma ramp when its contents change")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -2439,6 +2443,28 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
         bool use_pwl_gamma_ramp =
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
+        if (use_pwl_gamma_ramp && REXCVAR_GET(vulkan_log_gamma_ramp) &&
+            gamma_ramp_pwl_current_frame_ == UINT32_MAX) {
+          const reg::DC_LUT_PWL_DATA* gamma_ramp = gamma_ramp_pwl_rgb();
+          uint64_t signature = UINT64_C(14695981039346656037);
+          for (size_t i = 0; i < 128 * 3; ++i) {
+            signature ^= gamma_ramp[i].value;
+            signature *= UINT64_C(1099511628211);
+          }
+          static uint64_t last_logged_signature = 0;
+          if (signature != last_logged_signature) {
+            last_logged_signature = signature;
+            REXGPU_ERROR(
+                "[DISPLAY_GAMMA_PWL] control=0x{:08X} signature=0x{:016X} "
+                "ramp_r=[0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X},"
+                "0x{:08X},0x{:08X},0x{:08X},0x{:08X},0x{:08X}]",
+                register_file_->values[XE_GPU_REG_DC_LUTA_CONTROL], signature,
+                gamma_ramp[0 * 3].value, gamma_ramp[1 * 3].value, gamma_ramp[2 * 3].value,
+                gamma_ramp[4 * 3].value, gamma_ramp[8 * 3].value, gamma_ramp[16 * 3].value,
+                gamma_ramp[32 * 3].value, gamma_ramp[64 * 3].value, gamma_ramp[96 * 3].value,
+                gamma_ramp[127 * 3].value);
+          }
+        }
         bool swap_source_requires_compute_rb_swap =
             !vulkan_device->properties().imageViewFormatSwizzle && swap_source_needs_rb_swap;
         auto select_swap_apply_gamma_compute_pipeline = [&](bool use_pwl,
