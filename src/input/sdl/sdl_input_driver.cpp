@@ -194,6 +194,9 @@ X_RESULT SDLInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
 X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
 
+  static std::atomic<uint64_t> poll_count{0};
+  const uint64_t current_poll_count =
+      poll_count.fetch_add(1, std::memory_order_relaxed) + 1;
   auto is_active = this->is_active();
 
   if (is_active) {
@@ -220,6 +223,21 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     // Simulate an "untouched" controller. When we become active again the
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
+  }
+  if ((current_poll_count % 300) == 0) {
+    REXLOG_INFO(
+        "[HALO3_INPUT_POLL] count={} active={} pump_queued={} packet={} "
+        "buttons=0x{:04X} lt={} rt={} lx={} ly={} rx={} ry={}",
+        current_poll_count, is_active ? 1 : 0,
+        sdl_pumpevents_queued_.load(std::memory_order_relaxed) ? 1 : 0,
+        static_cast<uint32_t>(out_state->packet_number),
+        static_cast<uint16_t>(out_state->gamepad.buttons),
+        static_cast<uint8_t>(out_state->gamepad.left_trigger),
+        static_cast<uint8_t>(out_state->gamepad.right_trigger),
+        static_cast<int16_t>(out_state->gamepad.thumb_lx),
+        static_cast<int16_t>(out_state->gamepad.thumb_ly),
+        static_cast<int16_t>(out_state->gamepad.thumb_rx),
+        static_cast<int16_t>(out_state->gamepad.thumb_ry));
   }
   return X_ERROR_SUCCESS;
 }
@@ -680,8 +698,14 @@ void SDLInputDriver::QueueControllerUpdate() {
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
+      static std::atomic<uint64_t> pump_count{0};
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
+      const uint64_t current_pump_count =
+          pump_count.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((current_pump_count % 300) == 0) {
+        REXLOG_INFO("[HALO3_INPUT_PUMP] count={}", current_pump_count);
+      }
     });
   }
 }
