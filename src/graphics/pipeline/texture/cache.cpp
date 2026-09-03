@@ -930,10 +930,17 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
       }
       return;
     default:
-      REXGPU_WARN(
-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "is completely invalid!",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      // Some titles rewrite the address bits of an otherwise unchanged invalid
+      // fetch on every draw. Keep one concrete sample without turning normal
+      // gameplay into a synchronous warning stream.
+      static std::atomic_flag completely_invalid_texture_warning_logged = ATOMIC_FLAG_INIT;
+      if (!completely_invalid_texture_warning_logged.test_and_set(std::memory_order_relaxed)) {
+        REXGPU_WARN(
+            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+            "is completely invalid! Further warnings of this type are suppressed.",
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5);
+      }
       return;
   }
 

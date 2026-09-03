@@ -13,9 +13,15 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
+
+REXCVAR_DEFINE_BOOL(profile_settings_trace, false, "Kernel",
+                    "Log profile setting persistence and lookup details")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex {
 namespace system {
@@ -118,6 +124,9 @@ void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
 UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
   const auto& it = settings_.find(setting_id);
   if (it == settings_.end()) {
+    if (REXCVAR_GET(profile_settings_trace)) {
+      REXSYS_INFO("Profile setting lookup: id={:08X} implemented=false", setting_id);
+    }
     return nullptr;
   }
   UserProfile::Setting* setting = it->second;
@@ -127,6 +136,12 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
     if (kernel_state_->title_id() != setting->loaded_title_id) {
       LoadSetting(setting);
     }
+  }
+  if (REXCVAR_GET(profile_settings_trace)) {
+    REXSYS_INFO(
+        "Profile setting lookup: id={:08X} implemented=true set={} title_specific={} "
+        "loaded_title_id={:08X}",
+        setting_id, setting->is_set, setting->is_title_specific(), setting->loaded_title_id);
   }
   return setting;
 }
@@ -143,10 +158,16 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
       fseek(file, 0, SEEK_SET);
 
       std::vector<uint8_t> serialized_data(input_file_size);
-      fread(serialized_data.data(), 1, serialized_data.size(), file);
+      const size_t bytes_read = fread(serialized_data.data(), 1, serialized_data.size(), file);
       fclose(file);
       setting->Deserialize(serialized_data);
       setting->loaded_title_id = kernel_state_->title_id();
+      if (REXCVAR_GET(profile_settings_trace)) {
+        REXSYS_INFO("Profile setting loaded: id={} path={} bytes={} read={}", setting_id,
+                    file_path.string(), serialized_data.size(), bytes_read);
+      }
+    } else if (REXCVAR_GET(profile_settings_trace)) {
+      REXSYS_INFO("Profile setting not found: id={} path={}", setting_id, file_path.string());
     }
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
@@ -163,8 +184,17 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "wb");
-    fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
-    fclose(file);
+    if (file) {
+      const size_t bytes_written =
+          fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+      fclose(file);
+      if (REXCVAR_GET(profile_settings_trace)) {
+        REXSYS_INFO("Profile setting saved: id={} path={} bytes={} written={}", setting_id,
+                    file_path.string(), serialized_setting.size(), bytes_written);
+      }
+    } else {
+      REXSYS_ERROR("Unable to save profile setting: id={} path={}", setting_id, file_path.string());
+    }
   } else {
     // Unsupported for now.  Other settings aren't per-game and need to be
     // stored some other way.

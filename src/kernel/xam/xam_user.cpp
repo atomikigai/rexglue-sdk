@@ -21,6 +21,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/user_profile.h>
 #include <rex/system/xenumerator.h>
@@ -149,6 +150,14 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
                                       be<uint32_t>* setting_ids, uint32_t unk,
                                       be<uint32_t>* buffer_size_ptr, uint8_t* buffer,
                                       XAM_OVERLAPPED* overlapped) {
+  if (REXCVAR_GET(profile_settings_trace)) {
+    REXKRNL_INFO(
+        "Profile settings read: title_id={:08X} user_index={} xuid_count={} setting_count={} "
+        "buffer_size={} buffer_present={} overlapped={}",
+        title_id, user_index, xuid_count, setting_count,
+        buffer_size_ptr ? static_cast<uint32_t>(*buffer_size_ptr) : 0, buffer != nullptr,
+        overlapped != nullptr);
+  }
   if (!xuid_count) {
     assert_null(xuids);
   } else {
@@ -205,6 +214,10 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     if (!buffer_size) {
       *buffer_size_ptr = needed_size;
     }
+    if (REXCVAR_GET(profile_settings_trace)) {
+      REXKRNL_INFO("Profile settings read needs buffer: supplied={} needed={}", buffer_size,
+                   needed_size);
+    }
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
 
@@ -241,6 +254,9 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     }
   }
   if (any_missing) {
+    if (REXCVAR_GET(profile_settings_trace)) {
+      REXKRNL_INFO("Profile settings read rejected: one or more settings are unimplemented");
+    }
     // TODO(benvanik): don't fail? most games don't even check!
     if (overlapped) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(
@@ -280,6 +296,10 @@ uint32_t XamUserReadProfileSettingsEx(uint32_t title_id, uint32_t user_index, ui
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(
         REX_KERNEL_MEMORY()->HostToGuestVirtual(overlapped), X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
+  }
+  if (REXCVAR_GET(profile_settings_trace)) {
+    REXKRNL_INFO("Profile settings read completed: setting_count={} bytes={}", setting_count,
+                 needed_size);
   }
   return X_ERROR_SUCCESS;
 }
