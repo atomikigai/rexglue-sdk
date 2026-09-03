@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -73,9 +74,55 @@ REXCVAR_DEFINE_BOOL(vulkan_log_gamma_ramp, false, "GPU/Vulkan",
                     "Log the display gamma ramp when its contents change")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_present_timing_trace, false, "GPU/Vulkan",
+                    "Log one-second Vulkan presentation timing summaries")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+void RecordPresentTiming(bool presented) {
+  if (!REXCVAR_GET(vulkan_present_timing_trace)) {
+    return;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  static auto window_start = Clock::now();
+  static auto last_present = window_start;
+  static bool has_present = false;
+  static uint32_t presented_frames = 0;
+  static uint32_t skipped_frames = 0;
+  static double maximum_present_gap_ms = 0.0;
+
+  auto now = Clock::now();
+  if (presented) {
+    if (has_present) {
+      maximum_present_gap_ms =
+          std::max(maximum_present_gap_ms,
+                   std::chrono::duration<double, std::milli>(now - last_present).count());
+    }
+    last_present = now;
+    has_present = true;
+    ++presented_frames;
+  } else {
+    ++skipped_frames;
+  }
+
+  double window_seconds = std::chrono::duration<double>(now - window_start).count();
+  if (window_seconds < 1.0) {
+    return;
+  }
+  REXGPU_INFO(
+      "[VULKAN_PRESENT_TIMING] seconds={:.3f} presented={} skipped={} fps={:.2f} "
+      "max_gap_ms={:.2f}",
+      window_seconds, presented_frames, skipped_frames,
+      static_cast<double>(presented_frames) / window_seconds, maximum_present_gap_ms);
+  window_start = now;
+  presented_frames = 0;
+  skipped_frames = 0;
+  maximum_present_gap_ms = 0.0;
+}
 
 // glslang default built-in resource limits.
 constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
@@ -2304,6 +2351,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           "Skipping Vulkan frame presentation due to async placeholder draw "
           "usage in this frame");
     }
+    RecordPresentTiming(false);
     EndSubmission(true);
     return;
   }
@@ -2399,6 +2447,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           frontbuffer_width_scaled, frontbuffer_height_scaled);
     }
   }
+  RecordPresentTiming(true);
   REXGPU_DEBUG(
       "XELOG_GPU PRESENT: swap_texture_view={:p} packet_size={}x{} src_size={}x{} "
       "src_unscaled={}x{} guest_output_size={}x{} format={}",

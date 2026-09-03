@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 
@@ -914,12 +915,19 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
         break;
       }
-      REXGPU_WARN(
-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
-          "has \"invalid\" type! This is incorrect behavior, but you can try "
-          "bypassing this by launching Xenia with "
-          "--gpu_allow_invalid_fetch_constants=true.",
-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4, fetch.dword_5);
+      // This path can be reached for every draw in a frame. Preserve the first
+      // concrete constant for diagnosis without letting an unchanged warning
+      // consume gigabytes of logs or perturb frame timing.
+      static std::atomic_flag invalid_texture_warning_logged = ATOMIC_FLAG_INIT;
+      if (!invalid_texture_warning_logged.test_and_set(std::memory_order_relaxed)) {
+        REXGPU_WARN(
+            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+            "has \"invalid\" type! Further warnings of this type are suppressed. "
+            "This is incorrect behavior, but you can try bypassing this by launching "
+            "Xenia with --gpu_allow_invalid_fetch_constants=true.",
+            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
+            fetch.dword_5);
+      }
       return;
     default:
       REXGPU_WARN(

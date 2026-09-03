@@ -50,6 +50,26 @@ bool Entry::is_read_only() const {
   return device_->is_read_only();
 }
 
+void Entry::SetForDeletion(bool delete_on_close) {
+  auto global_lock = global_critical_region_.Acquire();
+  delete_on_close_ = delete_on_close;
+}
+
+void Entry::OpenFileHandle() {
+  auto global_lock = global_critical_region_.Acquire();
+  ++open_file_handle_count_;
+}
+
+bool Entry::CloseFileHandle() {
+  auto global_lock = global_critical_region_.Acquire();
+  assert_true(open_file_handle_count_ != 0);
+  --open_file_handle_count_;
+  if (open_file_handle_count_ != 0 || !delete_on_close_) {
+    return true;
+  }
+  return Delete();
+}
+
 Entry* Entry::GetChild(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
   // The size test is exact, not just a hint: the fold is ASCII-only, so any two

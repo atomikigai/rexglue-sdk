@@ -27,6 +27,7 @@ XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchr
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  file_->entry()->OpenFileHandle();
 }
 
 XFile::XFile() : XObject(kObjectType) {
@@ -37,7 +38,14 @@ XFile::XFile() : XObject(kObjectType) {
 XFile::~XFile() {
   // TODO(benvanik): signal that the file is closing?
   async_event_->Set();
+  if (!file_) {
+    return;
+  }
+  auto entry = file_->entry();
   file_->Destroy();
+  if (!entry->CloseFileHandle()) {
+    REXSYS_WARN("Failed to delete file marked for deletion: {}", entry->absolute_path());
+  }
 }
 
 uint64_t XFile::position() const {
@@ -356,6 +364,7 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
   }
 
   file->file_ = vfs_file;
+  file->file_->entry()->OpenFileHandle();
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;
 

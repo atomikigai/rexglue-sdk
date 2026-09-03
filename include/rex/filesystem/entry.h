@@ -98,7 +98,9 @@ class Entry {
   virtual bool SetCreateTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetAccessTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
   virtual bool SetWriteTimestamp([[maybe_unused]] uint64_t timestamp) { return false; }
-  void SetForDeletion(bool delete_on_close) { delete_on_close_ = delete_on_close; }
+  void SetForDeletion(bool delete_on_close);
+  void OpenFileHandle();
+  bool CloseFileHandle();
 
   bool is_read_only() const;
 
@@ -165,6 +167,7 @@ class Entry {
   uint64_t write_timestamp_;
   std::vector<std::unique_ptr<Entry>> children_;
   bool delete_on_close_ = false;
+  uint32_t open_file_handle_count_ = 0;
 };
 
 }  // namespace rex::filesystem

@@ -336,23 +336,42 @@ bool Runtime::SetupVfs() {
     }
   }
 
+  // Mount the title's persistent cache separately from the renderer's shader
+  // cache. Halo 3 stores campaign autosaves under cache1:\autosave, so routing
+  // Cache1 to the NullDevice makes a successful checkpoint disappear when the
+  // process exits.
+  auto cache1_root = std::filesystem::absolute(user_data_root_ / "cache1");
+  auto cache1_mount = "\\Device\\Harddisk0\\Cache1";
+  auto cache1_device =
+      std::make_unique<rex::filesystem::HostPathDevice>(cache1_mount, cache1_root, false);
+  if (!cache1_device->Initialize()) {
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize cache1 host path device at {}",
+                 cache1_root.string());
+    return false;
+  }
+  if (!file_system_->RegisterDevice(std::move(cache1_device))) {
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to register cache1 host path device");
+    return false;
+  }
+  file_system_->RegisterSymbolicLink("cache1:", cache1_mount);
+  REXSYS_DEBUG("  Mounted {} at cache1:", cache1_root.string());
+
   // Setup NullDevice for raw HDD partition accesses
   // Cache/STFC code baked into games tries reading/writing to these
   // Using a NullDevice returns success to all IO requests, allowing games
   // to believe cache/raw disk was accessed successfully.
   // NOTE: Must be registered AFTER Partition1 so Partition1 requests don't
   // go to NullDevice (VFS resolves devices in registration order)
-  auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"), std::string("\\Cache1")};
+  auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0")};
   auto null_device =
       std::make_unique<rex::filesystem::NullDevice>("\\Device\\Harddisk0", null_paths);
   if (null_device->Initialize()) {
     file_system_->RegisterDevice(std::move(null_device));
-    REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0,Cache1}}");
+    REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0}}");
   }
 
-  // NOTE: Do NOT register a device for cache: paths
-  // Games handle "device not found" gracefully but don't handle actual device
-  // errors (like NAME_COLLISION) well. Let cache: fail cleanly.
+  // Keep the generic cache: alias unregistered. Only cache1: has a confirmed
+  // title use and a dedicated writable mount.
 
   return true;
 }

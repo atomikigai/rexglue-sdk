@@ -22,6 +22,10 @@
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+REXCVAR_DEFINE_BOOL(sdl_input_trace, false, "Input",
+                    "Log a low-rate SDL controller trace for gameplay diagnostics");
+REXCVAR_DEFINE_BOOL(sdl_input_background, false, "Input",
+                    "Accept SDL controller input while the game window is inactive");
 
 namespace rex::input::sdl {
 
@@ -30,12 +34,13 @@ namespace {
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
 
-bool ShouldLogHalo3InputProbe(std::atomic<uint64_t>& next_log_uptime_ms) {
+bool ShouldLogInputTrace(std::atomic<uint64_t>& next_log_uptime_ms,
+                         uint64_t interval_ms) {
   const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
   uint64_t next = next_log_uptime_ms.load(std::memory_order_relaxed);
   while (now >= next) {
-    if (next_log_uptime_ms.compare_exchange_weak(next, now + 1000,
-                                                  std::memory_order_relaxed)) {
+    if (next_log_uptime_ms.compare_exchange_weak(next, now + interval_ms,
+                                                 std::memory_order_relaxed)) {
       return true;
     }
   }
@@ -206,10 +211,7 @@ X_RESULT SDLInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
 X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   assert(sdl_events_initialized_ && SDL_Gamepad_initialized_);
 
-  static std::atomic<uint64_t> poll_count{0};
-  const uint64_t current_poll_count =
-      poll_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  auto is_active = this->is_active();
+  auto is_active = REXCVAR_GET(sdl_input_background) || this->is_active();
 
   if (is_active) {
     QueueControllerUpdate();
@@ -236,21 +238,25 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
   }
-  static std::atomic<uint64_t> next_poll_log_uptime_ms{0};
-  if (ShouldLogHalo3InputProbe(next_poll_log_uptime_ms)) {
-    REXLOG_ERROR(
-        "[HALO3_INPUT_POLL] count={} active={} pump_queued={} packet={} "
-        "buttons=0x{:04X} lt={} rt={} lx={} ly={} rx={} ry={}",
-        current_poll_count, is_active ? 1 : 0,
-        sdl_pumpevents_queued_.load(std::memory_order_relaxed) ? 1 : 0,
-        static_cast<uint32_t>(out_state->packet_number),
-        static_cast<uint16_t>(out_state->gamepad.buttons),
-        static_cast<uint8_t>(out_state->gamepad.left_trigger),
-        static_cast<uint8_t>(out_state->gamepad.right_trigger),
-        static_cast<int16_t>(out_state->gamepad.thumb_lx),
-        static_cast<int16_t>(out_state->gamepad.thumb_ly),
-        static_cast<int16_t>(out_state->gamepad.thumb_rx),
-        static_cast<int16_t>(out_state->gamepad.thumb_ry));
+  if (REXCVAR_GET(sdl_input_trace)) {
+    static thread_local uint32_t poll_divider = 0;
+    static std::atomic<uint64_t> next_poll_log_uptime_ms{0};
+    if (!(++poll_divider & 0xFFFF) &&
+        ShouldLogInputTrace(next_poll_log_uptime_ms, 100)) {
+      REXLOG_ERROR(
+          "[HALO3_INPUT_POLL] active={} pump_queued={} packet={} "
+          "buttons=0x{:04X} lt={} rt={} lx={} ly={} rx={} ry={}",
+          is_active ? 1 : 0,
+          sdl_pumpevents_queued_.load(std::memory_order_relaxed) ? 1 : 0,
+          static_cast<uint32_t>(out_state->packet_number),
+          static_cast<uint16_t>(out_state->gamepad.buttons),
+          static_cast<uint8_t>(out_state->gamepad.left_trigger),
+          static_cast<uint8_t>(out_state->gamepad.right_trigger),
+          static_cast<int16_t>(out_state->gamepad.thumb_lx),
+          static_cast<int16_t>(out_state->gamepad.thumb_ly),
+          static_cast<int16_t>(out_state->gamepad.thumb_rx),
+          static_cast<int16_t>(out_state->gamepad.thumb_ry));
+    }
   }
   return X_ERROR_SUCCESS;
 }
@@ -329,7 +335,7 @@ X_RESULT SDLInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
       rex::ui::VirtualKey::kXInputPadRThumbDownLeft,
   };
 
-  auto is_active = this->is_active();
+  auto is_active = REXCVAR_GET(sdl_input_background) || this->is_active();
 
   if (is_active) {
     QueueControllerUpdate();
@@ -528,9 +534,6 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     // The pad can be removed between the event being posted and drained.
     return;
   }
-  REXLOG_ERROR("[HALO3_INPUT_PROBE] axis={} value={} instance={}",
-               static_cast<int>(event.gaxis.axis), static_cast<int>(event.gaxis.value),
-               static_cast<int>(event.gaxis.which));
   auto& pad = controllers_.at(*idx).state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
@@ -599,9 +602,11 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     // The pad can be removed between the event being posted and drained.
     return;
   }
-  REXLOG_ERROR("[HALO3_INPUT_PROBE] button={} down={} instance={}",
-               static_cast<int>(event.gbutton.button), event.gbutton.down ? 1 : 0,
-               static_cast<int>(event.gbutton.which));
+  if (REXCVAR_GET(sdl_input_trace)) {
+    REXLOG_ERROR("[HALO3_INPUT_PROBE] button={} down={} instance={}",
+                 static_cast<int>(event.gbutton.button), event.gbutton.down ? 1 : 0,
+                 static_cast<int>(event.gbutton.which));
+  }
   auto& controller = controllers_.at(*idx);
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
@@ -711,14 +716,16 @@ void SDLInputDriver::QueueControllerUpdate() {
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
-      static std::atomic<uint64_t> pump_count{0};
-      static std::atomic<uint64_t> next_pump_log_uptime_ms{0};
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
-      const uint64_t current_pump_count =
-          pump_count.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (ShouldLogHalo3InputProbe(next_pump_log_uptime_ms)) {
-        REXLOG_ERROR("[HALO3_INPUT_PUMP] count={}", current_pump_count);
+      if (!REXCVAR_GET(sdl_input_trace)) {
+        return;
+      }
+      static uint32_t pump_divider = 0;
+      static std::atomic<uint64_t> next_pump_log_uptime_ms{0};
+      if (!(++pump_divider & 0x3FF) &&
+          ShouldLogInputTrace(next_pump_log_uptime_ms, 1000)) {
+        REXLOG_ERROR("[HALO3_INPUT_PUMP]");
       }
     });
   }
