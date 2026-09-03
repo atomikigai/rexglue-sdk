@@ -30,6 +30,18 @@ namespace {
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
 
+bool ShouldLogHalo3InputProbe(std::atomic<uint64_t>& next_log_uptime_ms) {
+  const uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
+  uint64_t next = next_log_uptime_ms.load(std::memory_order_relaxed);
+  while (now >= next) {
+    if (next_log_uptime_ms.compare_exchange_weak(next, now + 1000,
+                                                  std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 }  // namespace
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
@@ -224,8 +236,9 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
   }
-  if ((current_poll_count % 300) == 0) {
-    REXLOG_INFO(
+  static std::atomic<uint64_t> next_poll_log_uptime_ms{0};
+  if (ShouldLogHalo3InputProbe(next_poll_log_uptime_ms)) {
+    REXLOG_ERROR(
         "[HALO3_INPUT_POLL] count={} active={} pump_queued={} packet={} "
         "buttons=0x{:04X} lt={} rt={} lx={} ly={} rx={} ry={}",
         current_poll_count, is_active ? 1 : 0,
@@ -515,9 +528,9 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
     // The pad can be removed between the event being posted and drained.
     return;
   }
-  REXLOG_INFO("[HALO3_INPUT_PROBE] axis={} value={} instance={}",
-              static_cast<int>(event.gaxis.axis), static_cast<int>(event.gaxis.value),
-              static_cast<int>(event.gaxis.which));
+  REXLOG_ERROR("[HALO3_INPUT_PROBE] axis={} value={} instance={}",
+               static_cast<int>(event.gaxis.axis), static_cast<int>(event.gaxis.value),
+               static_cast<int>(event.gaxis.which));
   auto& pad = controllers_.at(*idx).state.gamepad;
   switch (event.gaxis.axis) {
     case SDL_GAMEPAD_AXIS_LEFTX:
@@ -586,9 +599,9 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     // The pad can be removed between the event being posted and drained.
     return;
   }
-  REXLOG_INFO("[HALO3_INPUT_PROBE] button={} down={} instance={}",
-              static_cast<int>(event.gbutton.button), event.gbutton.down ? 1 : 0,
-              static_cast<int>(event.gbutton.which));
+  REXLOG_ERROR("[HALO3_INPUT_PROBE] button={} down={} instance={}",
+               static_cast<int>(event.gbutton.button), event.gbutton.down ? 1 : 0,
+               static_cast<int>(event.gbutton.which));
   auto& controller = controllers_.at(*idx);
 
   uint16_t xbuttons = controller.state.gamepad.buttons;
@@ -699,12 +712,13 @@ void SDLInputDriver::QueueControllerUpdate() {
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
       static std::atomic<uint64_t> pump_count{0};
+      static std::atomic<uint64_t> next_pump_log_uptime_ms{0};
       SDL_PumpEvents();
       sdl_pumpevents_queued_ = false;
       const uint64_t current_pump_count =
           pump_count.fetch_add(1, std::memory_order_relaxed) + 1;
-      if ((current_pump_count % 300) == 0) {
-        REXLOG_INFO("[HALO3_INPUT_PUMP] count={}", current_pump_count);
+      if (ShouldLogHalo3InputProbe(next_pump_log_uptime_ms)) {
+        REXLOG_ERROR("[HALO3_INPUT_PUMP] count={}", current_pump_count);
       }
     });
   }
