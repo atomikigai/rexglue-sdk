@@ -27,6 +27,14 @@ namespace rex::codegen {
 bool build_b(BuilderContext& ctx) {
   uint32_t target = ctx.insn.operands[0];
 
+  // The graph may contain nested entry points whose ranges overlap this
+  // FunctionNode. A branch to the node being emitted is still a local loop,
+  // regardless of which overlapping node getFunctionContaining selects.
+  if (target == ctx.fn.base()) {
+    ctx.println("\tgoto loc_{:X};", target);
+    return true;
+  }
+
   // Use graph to classify the target - handles thunks that branch to nearby functions
   // false = branch instruction (not a call), so own-base means loop back
   auto kind = ctx.graph().classifyTarget(target, ctx.base, false);
@@ -40,8 +48,7 @@ bool build_b(BuilderContext& ctx) {
     case TargetKind::Function:
     case TargetKind::Import:
       // Tail call to another function or import
-      ctx.emit_function_call(target);
-      ctx.println("\treturn;");
+      ctx.emit_tail_function_call(target);
       break;
 
     case TargetKind::Unknown:
@@ -149,8 +156,7 @@ bool build_bctr(BuilderContext& ctx) {
         case TargetKind::Function:
         case TargetKind::Import:
           if (auto* targetFn = ctx.graph().getFunction(label)) {
-            ctx.emitCtx.reference(targetFn->name());
-            ctx.println("\t\t{}(ctx, base);", targetFn->name());
+            ctx.emit_tail_named_call(label, targetFn->name());
           } else {
             REXCODEGEN_ERROR(
                 "Jump target 0x{:08X} classified as function but not in graph at bctr 0x{:08X}",
@@ -160,7 +166,6 @@ bool build_bctr(BuilderContext& ctx) {
                 "in graph at bctr 0x{:08X}\");",
                 label, ctx.base);
           }
-          ctx.println("\t\treturn;");
           break;
         default:
           REXCODEGEN_ERROR("Jump target 0x{:08X} unresolved at bctr 0x{:08X}", label, ctx.base);
@@ -180,8 +185,7 @@ bool build_bctr(BuilderContext& ctx) {
     // NOTE(tomc): If this is actually an unresolved switch table, the code after
     // will be unreachable. This is caught during analysis by discover_blocks.
     // The validation phase will report missing switch tables.
-    ctx.println("\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
-    ctx.println("\treturn;");
+    ctx.emit_tail_indirect_call(fmt::format("{}.u32", ctx.ctr()));
   }
   return true;
 }
@@ -196,8 +200,7 @@ bool build_bctrl(BuilderContext& ctx) {
 
 bool build_bnectr(BuilderContext& ctx) {
   ctx.println("\tif (!{}.eq) {{", ctx.cr(ctx.insn.operands[0]));
-  ctx.println("\t\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
-  ctx.println("\t\treturn;");
+  ctx.emit_tail_indirect_call(fmt::format("{}.u32", ctx.ctr()));
   ctx.println("\t}}");
   return true;
 }

@@ -53,6 +53,10 @@ struct FunctionConfig {
   // from a local. Callers sync their localized copies across the call site.
   bool shareRegisters = false;
 
+  // This target restores a complete guest context. A tail transfer to it must
+  // abandon the stale host call stack and resume at the restored guest LR.
+  bool nonlocalTransfer = false;
+
   // Get effective size (prefers size over end)
   uint32_t getSize(uint32_t address) const {
     return size ? size : (end > address ? end - address : 0);

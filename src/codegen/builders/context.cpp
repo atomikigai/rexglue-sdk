@@ -303,8 +303,42 @@ void BuilderContext::emit_function_call(uint32_t address) {
   println("\tREX_FATAL(\"Unresolved call from 0x{:08X} to 0x{:08X}\");", base, address);
 }
 
+void BuilderContext::emit_tail_function_call(uint32_t address) {
+  emit_function_call(address);
+  if (const auto* target = graph().getFunction(address); target && target->requiresNonlocalTransfer()) {
+    emit_nonlocal_context_transfer();
+  }
+  println("\treturn;");
+}
+
+void BuilderContext::emit_tail_named_call(uint32_t address, std::string_view name) {
+  emitCtx.reference(name);
+  println("\t{}(ctx, base);", name);
+  if (const auto* target = graph().getFunction(address); target && target->requiresNonlocalTransfer()) {
+    emit_nonlocal_context_transfer();
+  }
+  println("\treturn;");
+}
+
+void BuilderContext::emit_tail_indirect_call(std::string_view target) {
+  println("\tREX_CALL_INDIRECT_FUNC({});", target);
+  println("\treturn;");
+}
+
+void BuilderContext::emit_nonlocal_context_transfer() {
+  println("\tppc_resume_restored_context({});", language() == Language::C ? "ctx" : "&ctx");
+}
+
 void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
   uint32_t target = insn.operands[1];
+
+  // As with an unconditional branch, nested overlapping entry points must not
+  // make a jump to the FunctionNode being emitted look like an external call.
+  if (target == fn.base()) {
+    println("\tif ({}{}.{}) goto loc_{:08X};", not_ ? "!" : "", cr(insn.operands[0]), cond,
+            target);
+    return;
+  }
 
   // Use classifyTarget for consistent branch classification
   // false = branch instruction (not a call), so own-base means loop back
@@ -322,21 +356,12 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
       // Conditional tail call to another function - check pre-resolved call target
       if (const auto* callTarget = findCallTarget(base)) {
         if (callTarget->isFunction()) {
-          auto* targetFn = callTarget->asFunction();
-          emitCtx.reference(targetFn->name());
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", targetFn->name());
-          println("\t\treturn;");
+          emit_tail_function_call(target);
           println("\t}}");
         } else if (callTarget->isImport()) {
-          const auto& importTarget = std::get<CallTarget::ToImport>(callTarget->value);
-          std::string func_name = "__imp__" + importTarget.name;
-          std::replace(func_name.begin(), func_name.end(), '@', '_');
-          std::replace(func_name.begin(), func_name.end(), '.', '_');
-          emitCtx.reference(func_name);
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
-          println("\t\t{}(ctx, base);", func_name);
-          println("\t\treturn;");
+          emit_tail_function_call(target);
           println("\t}}");
         }
       } else {

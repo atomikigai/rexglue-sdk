@@ -645,7 +645,12 @@ void XThread::Execute() {
 
   // Execute the function
   REXSYS_NOISY_DEBUG("XThread::Execute - Calling function at {:08X}", address);
-  func(*ctx, base);
+  ctx->lr = 0;
+  if (!dispatcher->ExecuteWithContextTransfer(ctx, base, address, 0)) {
+    REXSYS_ERROR("XThread::Execute - Resumed function not registered at {:08X}",
+                 static_cast<uint32_t>(ctx->lr));
+    return;
+  }
 
   exit_code = static_cast<int>(ctx->r3.u32);
 

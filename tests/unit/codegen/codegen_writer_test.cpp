@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <rex/codegen/codegen_context.h>
+#include <codegen/codegen_language.h>
 #include <rex/codegen/codegen_writer.h>
 #include <rex/codegen/test_support.h>
 
@@ -44,6 +45,25 @@ std::vector<uint8_t> MakeBlrBinary(uint32_t functionCount) {
     data.insert(data.end(), {0x4E, 0x80, 0x00, 0x20});
   }
   return data;
+}
+
+// Big-endian `b +4` followed by `blr`: a direct tail transfer to the next node.
+std::vector<uint8_t> MakeTailBranchBinary() {
+  return {0x48, 0x00, 0x00, 0x04, 0x4E, 0x80, 0x00, 0x20};
+}
+
+std::vector<uint8_t> MakeBranchAndTailBinary() {
+  return {0x41, 0x82, 0x00, 0x08, 0x48, 0x00, 0x00, 0x08,
+          0x4E, 0x80, 0x00, 0x20, 0x4E, 0x80, 0x00, 0x20};
+}
+
+// Big-endian `nop; nop; nop; beq -8; b -12`: two nested forced entry points
+// overlapping a larger function, with the first forced function looping back
+// to its own entry through conditional and unconditional branches.
+std::vector<uint8_t> MakeOverlappingSelfBranchBinary() {
+  return {0x60, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00,
+          0x60, 0x00, 0x00, 0x00, 0x41, 0x82, 0xFF, 0xF8,
+          0x4B, 0xFF, 0xFF, 0xF4};
 }
 
 /// Whole-file contents, for asserting on emitted text.
@@ -251,4 +271,144 @@ TEST_CASE("Every name a recomp file calls is declared in its header", "[codegen_
       CHECK(declared.contains(called));
     }
   }
+}
+
+TEST_CASE("Ordinary tail branches return through their direct host call", "[codegen_writer]") {
+  auto data = MakeTailBranchBinary();
+  TestModule module;
+  module.Load(kBaseAddress, data.data(), data.size());
+
+  RecompilerConfig config;
+  config.projectName = "tail_transfer";
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.analysisState().format = "xex";
+  ctx.analysisState().loadAddress = kBaseAddress;
+  ctx.analysisState().entryPoint = kBaseAddress;
+  ctx.analysisState().imageSize = static_cast<uint32_t>(data.size());
+
+  auto* source = ctx.graph.addFunction(kBaseAddress, 4, FunctionAuthority::DISCOVERED, true);
+  auto* target = ctx.graph.addFunction(kBaseAddress + 4, 4, FunctionAuthority::DISCOVERED, true);
+  REQUIRE(source != nullptr);
+  REQUIRE(target != nullptr);
+  source->discover({{kBaseAddress, 4}}, {}, {});
+  target->discover({{kBaseAddress + 4, 4}}, {}, {});
+  ctx.graph.addTailCallToFunction(kBaseAddress, kBaseAddress, CallTarget::function(target));
+  source->seal();
+  target->seal();
+
+  EmitContext emitCtx{BinaryView::fromModule(module), ctx.Config(), ctx.graph};
+  auto emitted = source->emitCpp(emitCtx);
+
+  CHECK(emitted.find("sub_82000004(ctx, base);") != std::string::npos);
+  CHECK(emitted.find("rex_tail_lr_") == std::string::npos);
+  CHECK(emitted.find("ppc_resume_restored_context") == std::string::npos);
+
+  auto oldLanguage = GetCodegenLanguage();
+  SetCodegenLanguage(Language::C);
+  auto emittedC = source->emitCpp(emitCtx);
+  SetCodegenLanguage(oldLanguage);
+
+  CHECK(emittedC.find("sub_82000004(ctx, base);") != std::string::npos);
+  CHECK(emittedC.find("rex_tail_lr_") == std::string::npos);
+}
+
+TEST_CASE("Marked tail branches request a nonlocal context transfer", "[codegen_writer]") {
+  auto data = MakeBranchAndTailBinary();
+  TestModule module;
+  module.Load(kBaseAddress, data.data(), data.size());
+
+  RecompilerConfig config;
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.analysisState().entryPoint = kBaseAddress;
+
+  auto* source = ctx.graph.addFunction(kBaseAddress, 12, FunctionAuthority::DISCOVERED, true);
+  auto* target = ctx.graph.addFunction(kBaseAddress + 12, 4, FunctionAuthority::DISCOVERED, true);
+  REQUIRE(source != nullptr);
+  REQUIRE(target != nullptr);
+  source->discover({{kBaseAddress, 12}}, {}, {kBaseAddress + 8});
+  target->discover({{kBaseAddress + 12, 4}}, {}, {});
+  ctx.graph.addTailCallToFunction(kBaseAddress, kBaseAddress + 4, CallTarget::function(target));
+  source->seal();
+  target->seal();
+
+  EmitContext emitCtx{BinaryView::fromModule(module), ctx.Config(), ctx.graph};
+  auto emitted = source->emitCpp(emitCtx);
+  target->setRequiresNonlocalTransfer(true);
+  emitted = source->emitCpp(emitCtx);
+  CHECK(emitted.find("goto loc_82000008;") != std::string::npos);
+  CHECK(emitted.find("ppc_resume_restored_context(&ctx);") != std::string::npos);
+  CHECK(emitted.find("rex_tail_lr_") == std::string::npos);
+
+  auto oldLanguage = GetCodegenLanguage();
+  SetCodegenLanguage(Language::C);
+  auto emittedC = source->emitCpp(emitCtx);
+  SetCodegenLanguage(oldLanguage);
+  CHECK(emittedC.find("ppc_resume_restored_context(ctx);") != std::string::npos);
+}
+
+TEST_CASE("Overlapping forced entry points branch locally to their own base", "[codegen_writer]") {
+  auto data = MakeOverlappingSelfBranchBinary();
+  TestModule module;
+  module.Load(kBaseAddress, data.data(), data.size());
+
+  RecompilerConfig config;
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  ctx.analysisState().entryPoint = kBaseAddress;
+
+  auto* outer = ctx.graph.addFunction(kBaseAddress, 20, FunctionAuthority::DISCOVERED, true);
+  auto* forced =
+      ctx.graph.addFunction(kBaseAddress + 4, 16, FunctionAuthority::CONFIG, true);
+  auto* nested = ctx.graph.addFunction(kBaseAddress + 8, 12, FunctionAuthority::CONFIG, true);
+  REQUIRE(outer != nullptr);
+  REQUIRE(forced != nullptr);
+  REQUIRE(nested != nullptr);
+  outer->discover({{kBaseAddress, 20}}, {}, {});
+  forced->discover({{kBaseAddress + 4, 16}}, {}, {kBaseAddress + 4});
+  nested->discover({{kBaseAddress + 8, 12}}, {}, {});
+  outer->seal();
+  forced->seal();
+  nested->seal();
+
+  EmitContext emitCtx{BinaryView::fromModule(module), ctx.Config(), ctx.graph};
+  auto emitted = forced->emitCpp(emitCtx);
+
+  CHECK(emitted.find("if (ctx.cr0.eq) goto loc_82000004;") != std::string::npos);
+  CHECK(emitted.find("goto loc_82000004;") != std::string::npos);
+  CHECK(emitted.find("REX_FATAL") == std::string::npos);
+}
+
+TEST_CASE("Function config parses nonlocal transfer", "[codegen_writer]") {
+  auto table = toml::parse(R"(
+    file_path = "test.xex"
+    out_directory_path = "out"
+    [functions.0x82000004]
+    size = 4
+    nonlocal_transfer = true
+  )");
+  RecompilerConfig config;
+  REQUIRE(config.LoadFromTable(table, {}));
+  auto it = config.functions.find(kBaseAddress + 4);
+  REQUIRE(it != config.functions.end());
+  CHECK(it->second.nonlocalTransfer);
+}
+
+TEST_CASE("Jump-table tail targets retain explicit function and import resolution", "[codegen_writer]") {
+  std::vector<uint8_t> data{0x4E, 0x80, 0x04, 0x20};
+  TestModule module;
+  module.Load(kBaseAddress, data.data(), data.size());
+
+  RecompilerConfig config;
+  auto ctx = CodegenContext::Create(BinaryView::fromModule(module), std::move(config));
+  auto* source = ctx.graph.addFunction(kBaseAddress, 4, FunctionAuthority::DISCOVERED, true);
+  auto* import = ctx.graph.addImportFunction(kBaseAddress + 4, "__imp__tail_target");
+  REQUIRE(source != nullptr);
+  REQUIRE(import != nullptr);
+  source->discover({{kBaseAddress, 4}}, {}, {});
+  ctx.graph.addJumpTableToFunction(kBaseAddress, {kBaseAddress, 0, 3, {kBaseAddress + 4}});
+  source->seal();
+
+  EmitContext emitCtx{BinaryView::fromModule(module), ctx.Config(), ctx.graph};
+  auto emitted = source->emitCpp(emitCtx);
+  CHECK(emitted.find("__imp__tail_target(ctx, base);") != std::string::npos);
+  CHECK(emitted.find("REX_FATAL") == std::string::npos);
 }

@@ -594,6 +594,9 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
     if (node && cfg.shareRegisters) {
       node->setSharesRegisters(true);
     }
+    if (node && cfg.nonlocalTransfer) {
+      node->setRequiresNonlocalTransfer(true);
+    }
     configFuncs++;
 
     if (cfg.isChunk()) {

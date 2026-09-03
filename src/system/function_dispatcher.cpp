@@ -79,13 +79,43 @@ bool FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address) {
   uint64_t previous_lr = ctx->lr;
   ctx->lr = 0xBCBCBCBC;
 
-  fn(*ctx, memory_->virtual_membase());
+  if (!ExecuteWithContextTransfer(ctx, memory_->virtual_membase(), address, 0xBCBCBCBC)) {
+    ctx->lr = previous_lr;
+    ctx->r1.u64 += 64 + 112;
+    ThreadState::Bind(previous_thread_state);
+    return false;
+  }
 
   ctx->lr = previous_lr;
   ctx->r1.u64 += 64 + 112;
   ThreadState::Bind(previous_thread_state);
 
   return true;
+}
+
+bool FunctionDispatcher::ExecuteWithContextTransfer(PPCContext* ctx, uint8_t* base,
+                                                     uint32_t address, uint32_t terminal_lr) {
+  uint32_t dispatch_address = address;
+  bool resuming_context = false;
+  for (;;) {
+    PPCFunc* dispatch_fn = GetFunction(dispatch_address);
+    if (!dispatch_fn) {
+      REXCPU_ERROR("Execute({:08X}): resumed function not in function table", dispatch_address);
+      return false;
+    }
+
+    try {
+      dispatch_fn(*ctx, base);
+    } catch (const rex::ppc::ContextTransferSignal&) {
+      dispatch_address = static_cast<uint32_t>(ctx->lr);
+      resuming_context = true;
+      continue;
+    }
+    if (!resuming_context || ctx->lr == terminal_lr) {
+      return true;
+    }
+    dispatch_address = static_cast<uint32_t>(ctx->lr);
+  }
 }
 
 uint64_t FunctionDispatcher::Execute(ThreadState* thread_state, uint32_t address, uint64_t args[],

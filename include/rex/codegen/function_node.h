@@ -146,6 +146,9 @@ class FunctionNode {
   bool sharesRegisters() const { return sharesRegisters_; }
   void setSharesRegisters(bool val) { sharesRegisters_ = val; }
 
+  bool requiresNonlocalTransfer() const { return nonlocalTransfer_; }
+  void setRequiresNonlocalTransfer(bool val) { nonlocalTransfer_ = val; }
+
  private:
   //=========================================================================
   // Mutation methods - only FunctionGraph can call these
@@ -188,6 +191,7 @@ class FunctionNode {
   FunctionState state_ = FunctionState::kRegistered;
   bool hasExceptionHandler_ = false;
   bool sharesRegisters_ = false;
+  bool nonlocalTransfer_ = false;
 
   // Populated at discover()
   std::vector<Block> blocks_;

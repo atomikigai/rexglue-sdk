@@ -270,6 +270,25 @@ struct BuilderContext {
   void emit_function_call(uint32_t address);
 
   /**
+   * @brief Emit a tail call and honor an explicitly marked context restorer.
+   *
+   * A guest tail target may restore a different PPCContext, including its LR.
+   * Only targets configured as nonlocal transfers resume at the restored LR;
+   * ordinary tail calls retain their direct host call-and-return behavior.
+   */
+  void emit_tail_function_call(uint32_t address);
+
+  /// Emit a tail transfer to an already-resolved generated function name.
+  void emit_tail_named_call(uint32_t address, std::string_view name);
+
+  /// Same tail-transfer contract for a target known only at runtime.
+  void emit_tail_indirect_call(std::string_view target);
+
+  /// Emit a transfer to the current context's restored LR after an explicitly
+  /// configured context-restoring tail target returns.
+  void emit_nonlocal_context_transfer();
+
+  /**
    * @brief Emit C++ code for a conditional branch.
    * @param not_ If true, invert the condition
    * @param cond Condition field name ("eq", "lt", "gt")

@@ -27,6 +27,41 @@ using rex::testing::GetTestMemory;
 
 void DummyFn(PPCContext&, uint8_t*) {}
 
+constexpr uint32_t kTransferBase = 0x8A000000u;
+constexpr uint32_t kTransferTarget = kTransferBase + 0x10;
+constexpr uint32_t kFirstContinuation = kTransferBase + 0x20;
+constexpr uint32_t kSecondContinuation = kTransferBase + 0x30;
+bool g_stale_host_frame_resumed = false;
+int g_first_continuation_count = 0;
+int g_second_continuation_count = 0;
+bool g_normal_return_redispatched = false;
+
+void ContextRestorer(PPCContext& ctx, uint8_t*) { ctx.lr = kFirstContinuation; }
+
+void StaleHostCaller(PPCContext& ctx, uint8_t* base) {
+  ContextRestorer(ctx, base);
+  ppc_resume_restored_context(&ctx);
+  g_stale_host_frame_resumed = true;
+}
+
+void FirstContinuation(PPCContext& ctx, uint8_t*) {
+  ++g_first_continuation_count;
+  ctx.r3.u64 = 1;
+  ctx.lr = kSecondContinuation;
+}
+
+void SecondContinuation(PPCContext& ctx, uint8_t*) {
+  ++g_second_continuation_count;
+  ctx.r3.u64 = 2;
+  ctx.lr = 0xBCBCBCBC;
+}
+
+void NormalReturn(PPCContext& ctx, uint8_t*) {
+  ctx.lr = kTransferBase + 0x40;
+}
+
+void UnexpectedRedispatch(PPCContext&, uint8_t*) { g_normal_return_redispatched = true; }
+
 }  // namespace
 
 TEST_CASE("FunctionDispatcher: caller_address routes thunk to caller's module pool",
@@ -229,6 +264,47 @@ TEST_CASE("FunctionDispatcher: ExecuteTrap restores the interrupted register sta
   CHECK(ctx->f14.f64 == 2.5);
   CHECK(ctx->v14.u32[0] == 0x5555);
   CHECK(ctx->r1.u64 == saved_r1);
+}
+
+TEST_CASE("FunctionDispatcher: nonlocal transfer discards stale host frames and chains guest LR",
+          "[runtime][dispatcher]") {
+  auto& memory = GetTestMemory();
+  rex::runtime::ExportResolver resolver;
+  rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
+  constexpr uint32_t kCodeSize = 0x10000u;
+  constexpr uint32_t kImageSize = 0x100000u;
+  REQUIRE(dispatcher.InitializeFunctionTable(kTransferBase, kCodeSize, kTransferBase, kImageSize));
+  REQUIRE(dispatcher.SetFunction(kTransferTarget, &StaleHostCaller));
+  REQUIRE(dispatcher.SetFunction(kFirstContinuation, &FirstContinuation));
+  REQUIRE(dispatcher.SetFunction(kSecondContinuation, &SecondContinuation));
+
+  rex::runtime::ThreadState thread_state(1, 0x70000000u, 0x60000000u, &memory);
+  g_stale_host_frame_resumed = false;
+  g_first_continuation_count = 0;
+  g_second_continuation_count = 0;
+  uint64_t args[] = {0};
+  CHECK(dispatcher.Execute(&thread_state, kTransferTarget, args, rex::countof(args)) == 2);
+  CHECK_FALSE(g_stale_host_frame_resumed);
+  CHECK(g_first_continuation_count == 1);
+  CHECK(g_second_continuation_count == 1);
+  CHECK(thread_state.context()->lr == 0);
+}
+
+TEST_CASE("FunctionDispatcher: ordinary return does not redispatch its LR", "[runtime][dispatcher]") {
+  auto& memory = GetTestMemory();
+  rex::runtime::ExportResolver resolver;
+  rex::runtime::FunctionDispatcher dispatcher(&memory, &resolver);
+  constexpr uint32_t kCodeSize = 0x10000u;
+  constexpr uint32_t kImageSize = 0x100000u;
+  REQUIRE(dispatcher.InitializeFunctionTable(kTransferBase, kCodeSize, kTransferBase, kImageSize));
+  REQUIRE(dispatcher.SetFunction(kTransferTarget, &NormalReturn));
+  REQUIRE(dispatcher.SetFunction(kTransferBase + 0x40, &UnexpectedRedispatch));
+
+  rex::runtime::ThreadState thread_state(1, 0x70000000u, 0x60000000u, &memory);
+  g_normal_return_redispatched = false;
+  uint64_t args[] = {0};
+  dispatcher.Execute(&thread_state, kTransferTarget, args, rex::countof(args));
+  CHECK_FALSE(g_normal_return_redispatched);
 }
 
 TEST_CASE("PPCContext: non-volatile save area round-trips cr2-cr4 and fpscr",

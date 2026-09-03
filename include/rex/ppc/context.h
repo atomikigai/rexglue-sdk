@@ -36,6 +36,11 @@ constexpr float kPack2101010_Max2 = std::bit_cast<float>(0x40400003u);
 
 namespace rex::ppc {
 
+// Thrown by an explicitly marked context-restoring guest continuation. The
+// exception crosses only generated C++ frames and is caught at a host dispatch
+// boundary, avoiding setjmp/longjmp's destructor-skipping undefined behavior.
+struct ContextTransferSignal {};
+
 //=============================================================================
 // General Purpose Register
 //=============================================================================
@@ -477,3 +482,7 @@ struct alignas(0x40) PPCContext {
     fpscr.restoreGuestBits(saved_fpscr.csr);
   }
 };
+
+[[noreturn]] inline void ppc_resume_restored_context(PPCContext*) {
+  throw rex::ppc::ContextTransferSignal{};
+}

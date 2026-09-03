@@ -74,6 +74,14 @@ class FunctionDispatcher : public IModuleRegistrar {
   uint64_t ExecuteTrap(ThreadState* thread_state, uint32_t address, uint64_t args[],
                        size_t arg_count);
 
+  /**
+   * Run one guest entry at a host boundary. A marked context restorer may
+   * transfer here; only after that signal are normal continuation returns
+   * chained through ctx.lr until terminal_lr.
+   */
+  bool ExecuteWithContextTransfer(::PPCContext* ctx, uint8_t* base, uint32_t address,
+                                  uint32_t terminal_lr);
+
   // Shared thunk region size per module.
   static constexpr uint32_t kThunkReserveSize = 0x10000;  // 64KB
 
