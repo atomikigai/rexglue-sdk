@@ -23,6 +23,8 @@
 #include <rex/logging.h>
 #include <rex/system/guest_path.h>
 
+#include "codegen_language.h"
+
 namespace rex::codegen {
 
 std::string CanonicalizeModuleGuestPath(std::string_view path, std::string_view project_name) {
@@ -106,6 +108,15 @@ std::optional<ManifestConfig> ManifestConfig::Load(const std::filesystem::path& 
   if (auto root = (*project)["game_root"].value<std::string>(); root && !root->empty()) {
     manifest.gameRoot = *root;
   }
+  if (auto lang = (*project)["language"].value<std::string>(); lang && !lang->empty()) {
+    Language parsed;
+    if (ParseLanguage(*lang, parsed)) {
+      manifest.language = *lang;
+    } else {
+      REXLOG_WARN("Manifest [project].language '{}' is not \"cpp\" or \"c\"; ignoring: {}", *lang,
+                  path.string());
+    }
+  }
 
   auto* entrypoint = tbl["entrypoint"].as_table();
   if (!entrypoint) {
@@ -116,6 +127,8 @@ std::optional<ManifestConfig> ManifestConfig::Load(const std::filesystem::path& 
                         manifest.entrypoint)) {
     return std::nullopt;
   }
+  if (!manifest.entrypoint.recompiler.language)
+    manifest.entrypoint.recompiler.language = manifest.language;
 
   if (auto modules = tbl["modules"].as_array()) {
     size_t index = 0;
@@ -129,6 +142,8 @@ std::optional<ManifestConfig> ManifestConfig::Load(const std::filesystem::path& 
       if (!LoadBinaryConfig(*modTbl, manifest.manifestDir, manifest.projectName, binary)) {
         return std::nullopt;
       }
+      if (!binary.recompiler.language)
+        binary.recompiler.language = manifest.language;
       auto guest_path = (*modTbl)["guest_path"].value_or<std::string>("");
       if (guest_path.empty()) {
         REXLOG_ERROR("Manifest [[modules]] entry #{} missing guest_path", index);

@@ -29,7 +29,10 @@
 namespace rex::system {
 
 // Bump on any change to GpuCreateInfo or to the IGraphicsSystem interface.
-inline constexpr uint32_t kGpuPluginAbiVersion = 1;
+// v2: added IGraphicsSystem::SetupGuestGpu(rex::system::IGpuHost*), an
+// additive overload alongside the original FunctionDispatcher/KernelState
+// one (see rex/graphics/gpu_host.h) -- GpuCreateInfo itself is unchanged.
+inline constexpr uint32_t kGpuPluginAbiVersion = 2;
 
 inline constexpr const char* kGpuCreateSymbol = "rex_gpu_create";
 inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";

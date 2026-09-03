@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 
+#include "codegen_language.h"
 #include "codegen_logging.h"
 
 #include <dis-asm.h>
@@ -344,6 +345,13 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
 }
 
+// Direct-list-init ("Type var{};") is C++-only; C needs copy-list-init
+// ("Type var = {};", accepted by clang -std=gnu11 as a GNU extension for the
+// empty-braces case). Byte-identical to the prior "{}"-only spelling in C++.
+const char* zero_init_suffix() {
+  return rex::codegen::GetCodegenLanguage() == rex::codegen::Language::C ? " = {}" : "{}";
+}
+
 }  // namespace
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -419,6 +427,11 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           emit_print(out, "extern void ");
         }
 
+        // Mid-asm hooks take their register arguments by reference in C++;
+        // C has no references, so the C backend declares (and calls, see
+        // BuilderContext::emit_mid_asm_hook in builders/context.cpp)
+        // pointers instead.
+        const char* ref = GetCodegenLanguage() == Language::C ? "*" : "&";
         emit_print(out, "{}(", hookIt->second.name);
         for (auto& reg : hookIt->second.registers) {
           if (out.back() != '(')
@@ -427,24 +440,24 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           switch (reg[0]) {
             case 'c':
               if (reg == "ctr")
-                emit_print(out, "PPCRegister& ctr");
+                emit_print(out, "PPCRegister{} ctr", ref);
               else
-                emit_print(out, "PPCCRRegister& {}", reg);
+                emit_print(out, "PPCCRRegister{} {}", ref, reg);
               break;
             case 'x':
-              emit_print(out, "PPCXERRegister& xer");
+              emit_print(out, "PPCXERRegister{} xer", ref);
               break;
             case 'r':
-              emit_print(out, "PPCRegister& {}", reg);
+              emit_print(out, "PPCRegister{} {}", ref, reg);
               break;
             case 'f':
               if (reg == "fpscr")
-                emit_print(out, "PPCFPSCRRegister& fpscr");
+                emit_print(out, "PPCFPSCRRegister{} fpscr", ref);
               else
-                emit_print(out, "PPCRegister& {}", reg);
+                emit_print(out, "PPCRegister{} {}", ref, reg);
               break;
             case 'v':
-              emit_print(out, "PPCVRegister& {}", reg);
+              emit_print(out, "PPCVRegister{} {}", ref, reg);
               break;
           }
         }
@@ -511,6 +524,16 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
       // Only emit each label once
       if (labels.find(blockBase) != labels.end() && emittedLabels.insert(blockBase).second) {
         emit_println(body, "loc_{:X}:", blockBase);
+        if (GetCodegenLanguage() == Language::C) {
+          // A label recorded as a branch target by static analysis can still
+          // end up with no in-function `goto` (e.g. only reached from a
+          // manifest-forced gap-fill stub or a cross-block target that later
+          // analysis passes resolved away): -Wunused-label is a hard error
+          // under x360rt's -Werror. C++ does not need this (no -Werror on
+          // that pipeline's build), so it is not emitted there to keep that
+          // output byte-identical.
+          emit_println(body, "\t__attribute__((unused));");
+        }
         csrState = CSRState::Unknown;
       }
 
@@ -638,41 +661,42 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   }
 
   // --- Emit local variable declarations, then body ---
+  const char* zi = zero_init_suffix();
   if (localVariables.ctr)
-    emit_println(out, "\tPPCRegister ctr{{}};");
+    emit_println(out, "\tPPCRegister ctr{};", zi);
   if (localVariables.xer)
-    emit_println(out, "\tPPCXERRegister xer{{}};");
+    emit_println(out, "\tPPCXERRegister xer{};", zi);
   if (localVariables.reserved)
-    emit_println(out, "\tPPCRegister reserved{{}};");
+    emit_println(out, "\tPPCRegister reserved{};", zi);
 
   for (size_t i = 0; i < 8; i++) {
     if (localVariables.cr[i])
-      emit_println(out, "\tPPCCRRegister cr{}{{}};", i);
+      emit_println(out, "\tPPCCRRegister cr{}{};", i, zi);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.r[i])
-      emit_println(out, "\tPPCRegister r{}{{}};", i);
+      emit_println(out, "\tPPCRegister r{}{};", i, zi);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.f[i])
-      emit_println(out, "\tPPCRegister f{}{{}};", i);
+      emit_println(out, "\tPPCRegister f{}{};", i, zi);
   }
 
   for (size_t i = 0; i < 128; i++) {
     if (localVariables.v[i])
-      emit_println(out, "\tPPCVRegister v{}{{}};", i);
+      emit_println(out, "\tPPCVRegister v{}{};", i, zi);
   }
 
   if (localVariables.env)
-    emit_println(out, "\tPPCContext env{{}};");
+    emit_println(out, "\tPPCContext env{};", zi);
   if (localVariables.temp)
-    emit_println(out, "\tPPCRegister temp{{}};");
+    emit_println(out, "\tPPCRegister temp{};", zi);
   if (localVariables.v_temp)
-    emit_println(out, "\tPPCVRegister vTemp{{}};");
+    emit_println(out, "\tPPCVRegister vTemp{};", zi);
   if (localVariables.ea)
-    emit_println(out, "\tuint32_t ea{{}};");
+    emit_println(out, "\tuint32_t ea{};", zi);
 
   // If SEH, emit SEH_TRY and indent body
   if (generateSeh) {

@@ -35,8 +35,7 @@ bool build_andi(BuilderContext& ctx) {
   ctx.println("\t{}.u64 = {}.u64 & {};", ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
               ctx.insn.operands[2]);
   // ANDI. always sets CR0
-  ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
-              ctx.xer());
+  emitCompareToZero(ctx, 0, ctx.r(ctx.insn.operands[0]));
   return true;
 }
 
@@ -44,8 +43,7 @@ bool build_andis(BuilderContext& ctx) {
   ctx.println("\t{}.u64 = {}.u64 & {};", ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
               ctx.insn.operands[2] << 16);
   // ANDIS. always sets CR0
-  ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
-              ctx.xer());
+  emitCompareToZero(ctx, 0, ctx.r(ctx.insn.operands[0]));
   return true;
 }
 

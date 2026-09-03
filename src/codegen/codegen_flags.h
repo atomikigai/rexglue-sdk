@@ -33,3 +33,9 @@ REXCVAR_DECLARE(uint32_t, max_seh_scope_entries);
 REXCVAR_DECLARE(uint32_t, backward_scan_limit);
 REXCVAR_DECLARE(uint32_t, max_jump_table_entries);
 REXCVAR_DECLARE(uint32_t, max_blocks_per_function);
+
+// Codegen/Output language ("cpp" or "c"). Backs rex::codegen::GetCodegenLanguage()
+// (see codegen_language.h). Settable generically as --codegen_language=c, or via
+// the codegen subcommand's --lang flag / manifest [project].language, both of
+// which resolve to this cvar before CodegenWriter::write() runs.
+REXCVAR_DECLARE(std::string, codegen_language);

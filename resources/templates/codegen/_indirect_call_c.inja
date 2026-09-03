@@ -1,0 +1,41 @@
+//=============================================================================
+// Indirect Call Dispatch (C11 variant)
+//
+// Same dispatch contract as the C++ backend's _indirect_call.inja: bounds-check
+// against the caller's [REX_CODE_BASE, REX_CODE_BASE + REX_CODE_SIZE +
+// REX_THUNK_RESERVE_SIZE) range, falling back to x360_resolve_indirect (the
+// C-ABI equivalent of rex::runtime::ResolveIndirectFunction) for out-of-bounds
+// or unregistered slots. [[likely]]/[[unlikely]] become __builtin_expect;
+// functional-style casts become C-style casts; nullptr becomes NULL.
+//=============================================================================
+
+#ifdef REXGLUE_ENABLE_PROFILING
+#include <rex/perf/counter.h>
+#define REX_PROFILE_INDIRECT_DISPATCH() PROFILE_FUNCTION_DISPATCHED()
+#else
+#define REX_PROFILE_INDIRECT_DISPATCH()
+#endif
+
+extern PPCFunc* x360_resolve_indirect(u32 target);
+
+#define REX_LOOKUP_FUNC(x, y) \
+  (*(PPCFunc**)(x + REX_IMAGE_BASE + REX_IMAGE_SIZE + (((u64)((u32)(y) - REX_CODE_BASE)) * 2)))
+
+#define REX_CALL_INDIRECT_FUNC(x)                                                         \
+  do {                                                                                    \
+    REX_PROFILE_INDIRECT_DISPATCH();                                                      \
+    uint32_t rex_indirect_target_ = (uint32_t)(x);                                        \
+    PPCFunc* rex_indirect_func_;                                                          \
+    if (__builtin_expect((uint32_t)(rex_indirect_target_ - REX_CODE_BASE) <                \
+                             REX_CODE_SIZE + REX_THUNK_RESERVE_SIZE,                       \
+                         1)) {                                                            \
+      rex_indirect_func_ = REX_LOOKUP_FUNC(base, rex_indirect_target_);                   \
+    } else {                                                                              \
+      rex_indirect_func_ = NULL;                                                          \
+    }                                                                                     \
+    if (__builtin_expect(!rex_indirect_func_, 0)) {                                       \
+      ctx->last_indirect_target = rex_indirect_target_;                                   \
+      rex_indirect_func_ = x360_resolve_indirect(rex_indirect_target_);                   \
+    }                                                                                      \
+    rex_indirect_func_(ctx, base);                                                        \
+  } while (0)

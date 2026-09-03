@@ -18,6 +18,7 @@
 #include <rex/logging.h>
 
 #include "../codegen_logging.h"
+#include "../codegen_language.h"
 #include <rex/system/export_resolver.h>
 
 namespace rex::codegen {
@@ -39,6 +40,32 @@ const FunctionGraph& BuilderContext::graph() const {
 }
 
 //=============================================================================
+// Language-Conditional Emission Helpers
+//=============================================================================
+
+const char* BuilderContext::ctxPrefix() const {
+  return GetCodegenLanguage() == Language::C ? "ctx->" : "ctx.";
+}
+
+const char* BuilderContext::wholeCtx() const {
+  return GetCodegenLanguage() == Language::C ? "*ctx" : "ctx";
+}
+
+std::string BuilderContext::cast(std::string_view type) const {
+  if (GetCodegenLanguage() == Language::C)
+    return fmt::format("({})", type);
+  return fmt::format("static_cast<{}>", type);
+}
+
+const char* BuilderContext::cppNs() const {
+  return GetCodegenLanguage() == Language::C ? "" : "std::";
+}
+
+const char* BuilderContext::autoKw() const {
+  return GetCodegenLanguage() == Language::C ? "__auto_type" : "auto";
+}
+
+//=============================================================================
 // Register Accessors
 //=============================================================================
 
@@ -56,7 +83,7 @@ std::string BuilderContext::r(size_t index) {
     locals.r[index] = true;
     return fmt::format("r{}", index);
   }
-  return fmt::format("ctx.r{}", index);
+  return fmt::format("{}r{}", ctxPrefix(), index);
 }
 
 std::string BuilderContext::f(size_t index) {
@@ -66,7 +93,7 @@ std::string BuilderContext::f(size_t index) {
     locals.f[index] = true;
     return fmt::format("f{}", index);
   }
-  return fmt::format("ctx.f{}", index);
+  return fmt::format("{}f{}", ctxPrefix(), index);
 }
 
 std::string BuilderContext::v(size_t index) {
@@ -76,7 +103,7 @@ std::string BuilderContext::v(size_t index) {
     locals.v[index] = true;
     return fmt::format("v{}", index);
   }
-  return fmt::format("ctx.v{}", index);
+  return fmt::format("{}v{}", ctxPrefix(), index);
 }
 
 std::string BuilderContext::cr(size_t index) {
@@ -84,7 +111,7 @@ std::string BuilderContext::cr(size_t index) {
     locals.cr[index] = true;
     return fmt::format("cr{}", index);
   }
-  return fmt::format("ctx.cr{}", index);
+  return fmt::format("{}cr{}", ctxPrefix(), index);
 }
 
 const char* BuilderContext::ctr() {
@@ -92,7 +119,7 @@ const char* BuilderContext::ctr() {
     locals.ctr = true;
     return "ctr";
   }
-  return "ctx.ctr";
+  return GetCodegenLanguage() == Language::C ? "ctx->ctr" : "ctx.ctr";
 }
 
 const char* BuilderContext::xer() {
@@ -100,7 +127,7 @@ const char* BuilderContext::xer() {
     locals.xer = true;
     return "xer";
   }
-  return "ctx.xer";
+  return GetCodegenLanguage() == Language::C ? "ctx->xer" : "ctx.xer";
 }
 
 const char* BuilderContext::reserved() {
@@ -108,7 +135,7 @@ const char* BuilderContext::reserved() {
     locals.reserved = true;
     return "reserved";
   }
-  return "ctx.reserved";
+  return GetCodegenLanguage() == Language::C ? "ctx->reserved" : "ctx.reserved";
 }
 
 const char* BuilderContext::temp() {
@@ -183,11 +210,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
 
   if (address == cfg.setJmpAddress) {
     // Save PPCContext for restoration after longjmp
-    println("\t{} = ctx;", env());
+    println("\t{} = {};", env(), wholeCtx());
     // Use custom ppc_setjmp that uses guest address as key
     println("\t{}.s64 = ppc_setjmp({}.u32);", temp(), r(3));
     // Restore PPCContext if returning from longjmp
-    println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
+    println("\tif ({}.s64 != 0) {} = {};", temp(), wholeCtx(), env());
     println("\t{} = {};", r(3), temp());
     return;
   }
@@ -215,13 +242,13 @@ void BuilderContext::emit_function_call(uint32_t address) {
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
         for (size_t i = 14; i < 32; ++i) {
           if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
+            println("\t{}r{} = r{};", ctxPrefix(), i, i);
         }
         emitCtx.reference(name);
         println("\t{}(ctx, base);", name);
         for (size_t i = 14; i < 32; ++i) {
           if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
+            println("\tr{} = {}r{};", i, ctxPrefix(), i);
         }
         return;
       }
@@ -332,9 +359,15 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
 void BuilderContext::emit_set_flush_mode(bool enable) {
   auto newState = enable ? CSRState::VMX : CSRState::FPU;
   if (csrState != newState) {
-    auto prefix = enable ? "enable" : "disable";
-    auto suffix = csrState != CSRState::Unknown ? "Unconditional" : "";
-    println("\tctx.fpscr.{}FlushMode{}();", prefix, suffix);
+    const char* prefix = enable ? "enable" : "disable";
+    bool unconditional = csrState != CSRState::Unknown;
+    if (GetCodegenLanguage() == Language::C) {
+      // FPSCRRegister's methods are C++-only; the C backend calls the free-
+      // function equivalent declared by the runtime PCH instead.
+      println("\tx360_fpscr_{}_flush_mode{}(&ctx->fpscr);", prefix, unconditional ? "_unconditional" : "");
+    } else {
+      println("\tctx.fpscr.{}FlushMode{}();", prefix, unconditional ? "Unconditional" : "");
+    }
 
     csrState = newState;
   }
@@ -358,11 +391,17 @@ void BuilderContext::emit_mid_asm_hook() {
   if (returnsBool)
     print("if (");
 
-  // Build call -- no ctx/base prefix, just register arguments resolved through accessors
+  // Build call -- no ctx/base prefix, just register arguments resolved through accessors.
+  // Mid-asm hooks take arguments by reference in C++; C has no references, so
+  // the C backend passes pointers instead (matching the declaration emitted
+  // by FunctionNode::emit in function_graph.cpp).
+  bool isC = language() == Language::C;
   print("{}(", midAsmHook->second.name);
   for (auto& reg : midAsmHook->second.registers) {
     if (out.back() != '(')
       out += ", ";
+    if (isC)
+      out += "&";
 
     switch (reg[0]) {
       case 'c':
@@ -382,7 +421,7 @@ void BuilderContext::emit_mid_asm_hook() {
         break;
       case 'f':
         if (reg == "fpscr")
-          out += "ctx.fpscr";
+          out += fmt::format("{}fpscr", ctxPrefix());
         else
           out += f(std::atoi(reg.c_str() + 1));
         break;
@@ -475,11 +514,15 @@ void BuilderContext::emit_vec_var_shift(const char* shift_dir, const char* eleme
   println("\t\tsimde__m128i b = simde_mm_load_si128((simde__m128i*){}.u8);", vB);
   println("\t\tsimde__m128i shift = simde_mm_and_si128(b, simde_mm_set1_{}(0x{:X}));", element_type,
           mask_value);
+  // rex::ppc::simde_mm_{sllv,srlv,srav}_epi16/epi8 are C++ namespaced helpers
+  // (include/rex/ppc/intrinsics.h); the C backend calls the equivalent
+  // x360_-prefixed free functions defined inline in the C PCH (pch_h_c.inja).
+  const char* ns = GetCodegenLanguage() == Language::C ? "x360_" : "rex::ppc::";
   println(
       "\t\tsimde_mm_store_si128((simde__m128i*){}.u8, "
-      "rex::ppc::simde_mm_{}_{}"
+      "{}simde_mm_{}_{}"
       "(a, shift));",
-      vD, shift_dir, element_type);
+      vD, ns, shift_dir, element_type);
   println("\t}}");
 }
 

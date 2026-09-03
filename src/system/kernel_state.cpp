@@ -27,6 +27,7 @@
 #include <rex/kernel/xboxkrnl/threading.h>
 #include <rex/system/kernel_module.h>
 #include <rex/system/kernel_state.h>
+#include <rex/filesystem.h>
 #include <rex/system/function_dispatcher.h>
 #include <chrono>
 #include <thread>
@@ -759,8 +760,13 @@ object_ref<UserModule> KernelState::LoadUserModule(const std::string_view raw_na
     }
 
     rex::platform::DynamicLibrary library_local;
-    if (!library_local.Load(std::filesystem::path(recomp->shared_lib_name),
-                            rex::platform::SymbolResolution::kImmediate)) {
+    // Resolve relative to the executable folder, like the GPU plugin loader:
+    // dlopen() with a bare name does not search the caller's directory.
+    std::filesystem::path module_lib_path(recomp->shared_lib_name);
+    if (module_lib_path.is_relative()) {
+      module_lib_path = rex::filesystem::GetExecutableFolder() / module_lib_path;
+    }
+    if (!library_local.Load(module_lib_path, rex::platform::SymbolResolution::kImmediate)) {
       REXSYS_ERROR("Failed to load shared library for module '{}'", recomp->pe_name);
     } else {
       auto register_func = reinterpret_cast<runtime::FunctionDispatcher::RegisterFn>(

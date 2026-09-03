@@ -97,6 +97,9 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
   if (auto v = toml["template_dir"].value<std::string>()) {
     MergeScalar(cfg.templateDir, *v, "template_dir");
   }
+  if (auto v = toml["language"].value<std::string>()) {
+    cfg.language = *v;
+  }
 
   // Bool scalars
   auto hasBool = [&](const char* key) -> bool { return toml[key].is_boolean(); };

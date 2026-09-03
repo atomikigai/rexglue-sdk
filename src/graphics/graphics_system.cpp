@@ -120,6 +120,39 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   memory_ = function_dispatcher->memory();
   function_dispatcher_ = function_dispatcher;
   kernel_state_ = kernel_state;
+  owned_gpu_host_ = std::make_unique<system::SdkGpuHost>(function_dispatcher, kernel_state);
+  return SetupGuestGpu(owned_gpu_host_.get());
+}
+
+X_STATUS GraphicsSystem::SetupGuestGpu(system::IGpuHost* gpu_host) {
+  gpu_host_ = gpu_host;
+
+  if (!memory_) {
+    // Set up directly through IGpuHost (no FunctionDispatcher, e.g.
+    // rexglue-sdk's C shim): backend subsystems (SharedMemory/
+    // PrimitiveProcessor/TextureCache, constructed inside
+    // CommandProcessor::Initialize below) still need a real rex::memory::
+    // Memory instance for their own host-GPU bookkeeping (EDRAM, staging
+    // buffers, physical-memory write-watching). Guest-address translation
+    // for ring buffer/register I/O always goes through gpu_host_, never
+    // through this instance.
+    //
+    // Prefer mirroring the host's own membase (Memory::InitializeExternal)
+    // so real guest vertex/texture/constant content written through
+    // gpu_host->membase() (e.g. x360recomp's x360rt) is visible to those
+    // subsystems; only fall back to a private, unshared arena
+    // (Memory::Initialize) when the host has no membase to mirror.
+    fallback_memory_ = std::make_unique<memory::Memory>();
+    uint8_t* host_membase = gpu_host_->membase();
+    bool initialized = host_membase ? fallback_memory_->InitializeExternal(host_membase)
+                                    : fallback_memory_->Initialize();
+    if (!initialized) {
+      REXGPU_ERROR("Unable to initialize GPU memory ({})",
+                   host_membase ? "external host mirror" : "private fallback arena");
+      return X_STATUS_UNSUCCESSFUL;
+    }
+    memory_ = fallback_memory_.get();
+  }
 
   // Headless path: no one set up presentation, so build a no-presentation
   // provider just for the command processor.
@@ -137,45 +170,48 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
 
-  // Register GPU MMIO handlers
-  // GPU registers are at 0x7FC80000-0x7FCFFFFF
-  memory_->AddVirtualMappedRange(0x7FC80000,  // base address
-                                 0xFFFF0000,  // mask
-                                 0x0000FFFF,  // size (64KB)
-                                 this,        // context (GraphicsSystem*)
-                                 reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
-                                 reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
+  // Register GPU MMIO handlers. GPU registers are at 0x7FC80000-0x7FCFFFFF.
+  mmio_range_handle_ = gpu_host_->AddMmioRange(
+      0x7FC80000,  // base address
+      0xFFFF0000,  // mask
+      0x0000FFFF,  // size (64KB)
+      this,        // context (GraphicsSystem*)
+      reinterpret_cast<system::GpuMmioReadCallback>(ReadRegisterThunk),
+      reinterpret_cast<system::GpuMmioWriteCallback>(WriteRegisterThunk));
 
   // Guest vblank timer based on the configured guest video mode.
   vsync_worker_running_ = true;
-  vsync_worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-        system::X_VIDEO_MODE video_mode;
-        kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
-        uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        uint64_t vsync_interval_ticks =
-            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
-        while (vsync_worker_running_) {
-          uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          uint64_t interval_ticks =
-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
-            MarkVblank();
-            last_frame_time += interval_ticks;
-          }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
-        }
-        return 0;
-      }));
-  // TODO: set_can_debugger_suspend not yet ported
-  // vsync_worker_thread_->set_can_debugger_suspend(true);
-  vsync_worker_thread_->set_name("GPU VSync");
-  vsync_worker_thread_->Create();
+  vsync_worker_thread_ = gpu_host_->CreateHostThread("GPU VSync", &RunVsyncLoopThunk, this);
 
   return X_STATUS_SUCCESS;
+}
+
+void GraphicsSystem::RunVsyncLoopThunk(void* user) {
+  static_cast<GraphicsSystem*>(user)->RunVsyncLoop();
+}
+
+void GraphicsSystem::RunVsyncLoop() {
+  // Nanoseconds: gpu_host_->QueryGuestTickCount's units (see gpu_host.h) --
+  // purely a host-side scheduling interval, never guest-visible, so unlike
+  // the FunctionDispatcher/KernelState path this does not need to match the
+  // Xbox 360's actual guest timebase frequency.
+  constexpr uint64_t kTicksPerSecond = 1'000'000'000ull;
+  system::X_VIDEO_MODE video_mode;
+  kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+  double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+  uint64_t vsync_interval_ticks =
+      std::max(uint64_t(1), uint64_t(double(kTicksPerSecond) / refresh_rate_hz));
+  uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), kTicksPerSecond / 1000);
+  uint64_t last_frame_time = gpu_host_->QueryGuestTickCount();
+  while (vsync_worker_running_) {
+    uint64_t current_time = gpu_host_->QueryGuestTickCount();
+    uint64_t interval_ticks = REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+    while (current_time - last_frame_time >= interval_ticks) {
+      MarkVblank();
+      last_frame_time += interval_ticks;
+    }
+    rex::thread::Sleep(std::chrono::milliseconds(1));
+  }
 }
 
 void GraphicsSystem::Shutdown() {
@@ -186,8 +222,13 @@ void GraphicsSystem::Shutdown() {
 
   if (vsync_worker_thread_) {
     vsync_worker_running_ = false;
-    vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+    vsync_worker_thread_->Join();
     vsync_worker_thread_.reset();
+  }
+
+  if (gpu_host_ && mmio_range_handle_) {
+    gpu_host_->RemoveMmioRange(mmio_range_handle_);
+    mmio_range_handle_ = 0;
   }
 
   if (presenter_) {
@@ -291,29 +332,21 @@ void GraphicsSystem::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_siz
 void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data) {
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;
+  if (gpu_host_) {
+    gpu_host_->SetInterruptTarget(callback, user_data);
+  }
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
-  if (!interrupt_callback_) {
-    return;
+  // Whether there is anything to actually raise is the host's call: hosts
+  // that track the guest callback themselves (rexglue-sdk's C shim, via
+  // x360rt's own VdSetGraphicsInterruptCallback state) never go through
+  // SetInterruptCallback above, so interrupt_callback_ would stay 0 for them
+  // even with a real guest callback registered.
+  if (gpu_host_) {
+    gpu_host_->RaiseGraphicsInterrupt(source, cpu);
   }
-
-  auto thread = system::XThread::GetCurrentThread();
-  assert_not_null(thread);
-
-  // Pick a CPU, if needed. We're going to guess 2. Because.
-  if (cpu == 0xFFFFFFFF) {
-    cpu = 2;
-  }
-  thread->SetActiveCpu(cpu);
-
-  // REXGPU_INFO("Dispatching GPU interrupt at {:08X} w/ mode {} on cpu {}",
-  //          interrupt_callback_, source, cpu);
-
-  uint64_t args[] = {source, interrupt_callback_data_};
-  function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
-                                         rex::countof(args));
 }
 
 void GraphicsSystem::MarkVblank() {

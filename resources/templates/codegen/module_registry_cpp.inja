@@ -4,11 +4,26 @@
 
 #include <rex/system/kernel_state.h>
 
+// mod.shared_lib_name is the bare CMake target/OUTPUT_NAME (no prefix or
+// extension; see src/codegen/project_recompiler.cpp's "shared_lib_name" and
+// "lib_name" entries, and dll_targets_cmake.inja's add_library() call, which
+// share that same base name). rex::platform::DynamicLibrary::Load()
+// (kernel_state.cpp) passes this string straight to dlopen()/LoadLibrary(),
+// so it must already be CMake's actual platform output filename: CMake's
+// default SHARED-library naming adds "lib"+".so" on Linux, "lib"+".dylib" on
+// macOS, and just ".dll" (no prefix) on Windows.
 void RegisterRecompiledModules(rex::system::KernelState* kernel_state) {
 {% for mod in dll_modules %}
   kernel_state->RegisterRecompiledModule(
       "{{ mod.pe_name }}",
       "{{ mod.guest_path }}",
-      "{{ mod.shared_lib_name }}");
+#if defined(_WIN32)
+      "{{ mod.shared_lib_name }}.dll"
+#elif defined(__APPLE__)
+      "lib{{ mod.shared_lib_name }}.dylib"
+#else
+      "lib{{ mod.shared_lib_name }}.so"
+#endif
+      );
 {% endfor %}
 }

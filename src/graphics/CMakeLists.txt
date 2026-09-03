@@ -17,6 +17,7 @@ set(REXGPU_XENOS_SOURCES
 
     # GPU system
     graphics_system.cpp
+    sdk_gpu_host.cpp
     command_processor.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
@@ -156,5 +157,28 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+    )
+endif()
+
+# rexgpu-xenos-cshim: C ABI adapter x360recomp's runtime/src/video/
+# gpu_backend_dynamic.c dlopen()s (x360rt/gpu.h's dynamic GPU backend; see
+# c_shim/x360_gpu_shim.cpp's file header). In-tree target so it builds as a
+# normal dependent of rexgpu-xenos/rexruntime instead of the fragile
+# "link an already-built .so from out/" scheme c_shim/CMakeLists.txt uses
+# for a standalone build outside this tree (kept working for that use case;
+# not needed when building through this file).
+if(REXGLUE_USE_VULKAN)
+    add_library(rexgpu-xenos-cshim SHARED c_shim/x360_gpu_shim.cpp)
+
+    set_target_properties(rexgpu-xenos-cshim PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+
+    target_compile_options(rexgpu-xenos-cshim PRIVATE -Wall -Wextra)
+
+    target_link_libraries(rexgpu-xenos-cshim PRIVATE
+        rexruntime
+        rexgpu-xenos
     )
 endif()

@@ -24,8 +24,11 @@
 
 #include <rex/codegen/manifest.h>
 #include <rex/codegen/project_recompiler.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/version.h>
+
+#include "codegen/codegen_language.h"
 
 namespace rexglue::cli {
 
@@ -134,7 +137,46 @@ struct CodegenArgs {
   std::string config_path;
   std::vector<std::string> targets;
   bool ignore_stamp = false;
+  std::string lang;  // "cpp" (default) or "c"; empty = not passed on the CLI
 };
+
+/**
+ * Reads the manifest's resolved `[project].language` (ManifestConfig::Load()
+ * parses and validates it, and threads it onto entrypoint/module
+ * RecompilerConfig::language too; see include/rex/codegen/manifest.h).
+ * Returns nullopt when the manifest fails to load or doesn't set a language.
+ */
+std::optional<rex::codegen::Language> ManifestLanguage(const fs::path& manifest_path) {
+  auto manifest = rex::codegen::ManifestConfig::Load(manifest_path);
+  if (!manifest || !manifest->language)
+    return std::nullopt;
+  rex::codegen::Language lang;
+  if (!rex::codegen::ParseLanguage(*manifest->language, lang))
+    return std::nullopt;
+  return lang;
+}
+
+/**
+ * Resolves the codegen output language and applies it to the codegen_language
+ * cvar (see codegen_flags.h) before codegen runs. Precedence: an explicit
+ * --lang on this subcommand always wins; otherwise an explicit
+ * --codegen_language already applied during global CLI parsing is left
+ * alone; otherwise the manifest's [project].language is used; otherwise the
+ * long-standing "cpp" default applies untouched (no behavior change).
+ */
+void ResolveAndApplyLanguage(const std::string& cli_lang, const fs::path& manifest_path) {
+  rex::codegen::Language lang;
+  if (!cli_lang.empty() && rex::codegen::ParseLanguage(cli_lang, lang)) {
+    rex::cvar::SetFlagByName("codegen_language", cli_lang);
+    return;
+  }
+  if (rex::cvar::GetFlagSource("codegen_language") == rex::cvar::Source::kCommandLine)
+    return;
+  if (auto manifest_lang = ManifestLanguage(manifest_path)) {
+    rex::cvar::SetFlagByName("codegen_language",
+                             rex::codegen::LanguageSourceExt(*manifest_lang));
+  }
+}
 
 }  // namespace
 
@@ -229,6 +271,9 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
       ->take_all();
   sub->add_flag("--ignore-stamp", args->ignore_stamp,
                 "Regenerate even when inputs match the recorded stamp");
+  sub->add_option("--lang", args->lang, "Output language: cpp (default) or c")
+      ->type_name("LANG")
+      ->check(CLI::IsMember({"cpp", "c"}));
 
   sub->callback([args, &ctx, &pending]() {
     pending = [args, &ctx]() -> Result<void> {
@@ -239,6 +284,7 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
           return Err<void>(discovered.error());
         path = *discovered;
       }
+      ResolveAndApplyLanguage(args->lang, fs::path(path));
       return CodegenFromConfig(path, ctx, args->targets, args->ignore_stamp);
     };
   });

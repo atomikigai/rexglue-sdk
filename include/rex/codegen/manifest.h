@@ -46,6 +46,9 @@ struct ManifestConfig {
   std::filesystem::path manifestPath;     ///< File this manifest was loaded from
   std::optional<std::string> gameRoot;    ///< Game asset root, relative to manifestDir.
                                           ///< Set by `rexglue init` to anchor DLL guest paths.
+  std::optional<std::string> language;    ///< [project].language ("cpp"|"c"); threaded onto
+                                          ///< entrypoint/modules' RecompilerConfig::language by
+                                          ///< Load() when a binary doesn't set its own.
   std::filesystem::path manifestDir;      ///< Directory containing the manifest
   BinaryConfig entrypoint;                ///< Entrypoint codegen settings (inline)
   std::vector<BinaryConfig> modules;      ///< DLL module codegen settings (inline)

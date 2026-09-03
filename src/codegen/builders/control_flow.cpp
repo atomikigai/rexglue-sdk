@@ -63,7 +63,7 @@ bool build_bl(BuilderContext& ctx) {
 
   // Always set LR (unless skipLr)
   if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
+    ctx.println("\t{}lr = 0x{:X};", ctx.ctxPrefix(), ctx.base + 4);
 
   // Use graph to classify the target
   // true = call instruction, so own-base means recursive call (not loop back)
@@ -98,10 +98,13 @@ bool build_blr(BuilderContext& ctx) {
 
 bool build_blrl(BuilderContext& ctx) {
   // BLRL: save return address, then branch-and-link to current LR
-  ctx.println("\t{{ auto old_lr = ctx.lr;");
+  ctx.println("\t{{ {} old_lr = {}lr;", ctx.autoKw(), ctx.ctxPrefix());
   if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
-  ctx.println("\tREX_CALL_INDIRECT_FUNC(uint32_t(old_lr)); }}");
+    ctx.println("\t{}lr = 0x{:X};", ctx.ctxPrefix(), ctx.base + 4);
+  // C++ keeps the functional-cast spelling byte-identical to prior output;
+  // functional-style casts are C++-only, so C uses a C-style cast instead.
+  ctx.println("\tREX_CALL_INDIRECT_FUNC({}); }}",
+              ctx.language() == Language::C ? "(uint32_t)(old_lr)" : "uint32_t(old_lr)");
   ctx.csrState = CSRState::Unknown;
   return true;
 }
@@ -185,7 +188,7 @@ bool build_bctr(BuilderContext& ctx) {
 
 bool build_bctrl(BuilderContext& ctx) {
   if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = 0x{:X};", ctx.base + 4);
+    ctx.println("\t{}lr = 0x{:X};", ctx.ctxPrefix(), ctx.base + 4);
   ctx.println("\tREX_CALL_INDIRECT_FUNC({}.u32);", ctx.ctr());
   ctx.csrState = CSRState::Unknown;  // the call could change it
   return true;

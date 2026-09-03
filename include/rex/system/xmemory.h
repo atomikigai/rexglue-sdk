@@ -370,6 +370,49 @@ class Memory {
   // mapping to the file system fails.
   bool Initialize();
 
+  // Initializes the memory system over memory an external host already owns
+  // and has mapped, instead of creating this Memory's own memory-mapped-file
+  // arena (see Initialize()). Built for x360recomp's x360rt C runtime, whose
+  // GPU shim (rex/graphics/c_shim/x360_gpu_shim.cpp) constructs a Memory this
+  // way so GraphicsSystem's SharedMemory/PrimitiveProcessor/TextureCache can
+  // read real guest vertex/texture/constant content instead of an unshared,
+  // privately mmap'd fallback.
+  //
+  // `external_membase` must be a 4 GiB (0x100000000-byte), page-aligned,
+  // read/write host mapping laid out like x360rt/mem.h's guest address
+  // space: guest virtual address `a` lives at `external_membase + a`. This
+  // call places physical_membase() at `external_membase + 0xA0000000` to
+  // match x360rt's x360_mem_translate_physical formula exactly (see
+  // src/system/xmemory.cpp), so TranslatePhysical/TranslateVirtual resolve
+  // to the same bytes x360rt itself writes and reads -- no separate mmap
+  // views or aliasing are created here, unlike Initialize()'s own arena.
+  //
+  // Ownership of `external_membase` stays with the caller: this Memory never
+  // mmaps or munmaps it (Reset()/the destructor never touch it beyond normal
+  // heap bookkeeping). Only the guest-physical range aliased through
+  // 0xA0000000 is backed by real memory; the 0xC0000000/0xE0000000 heaps are
+  // initialized for bookkeeping only (LookupHeap/Dispose safety) because
+  // x360rt itself does not yet alias those views onto the same physical
+  // bytes (see its mem.h doc comment) -- this mirrors that existing
+  // limitation rather than working around it.
+  //
+  // Does not install an MMIOHandler write-watch (EnablePhysicalMemoryAccess
+  // Callbacks is a documented no-op in this mode -- see its own comment):
+  // the host machine code that writes this memory was not necessarily
+  // produced by this module's own recompiler, so this module cannot safely
+  // assume rex::system::ExceptionHandler's x86 store-instruction decoder
+  // recognizes every store shape a foreign recompiler emits. Callers that
+  // need fresh guest data every frame (see CommandProcessor::
+  // ExecutePacketType3_XE_SWAP, gated on is_external()) call
+  // GraphicsSystem::InvalidateGpuMemory() instead. Never fails once
+  // `external_membase` is non-null (there is no host address space to
+  // reserve, unlike Initialize()).
+  bool InitializeExternal(uint8_t* external_membase);
+
+  // Whether this instance was built by InitializeExternal() rather than
+  // Initialize(); see InitializeExternal's own comment for what changes.
+  bool is_external() const { return external_mode_; }
+
   // Resets all memory to zero and resets all allocations.
   void Reset();
 
@@ -572,11 +615,29 @@ class Memory {
       std::unique_lock<std::recursive_mutex> global_lock_locked_once, void* context,
       void* host_address, bool is_write);
 
+  // Whether `host_address` falls in the range AccessViolationCallback should
+  // handle. In the normal Initialize() arena, physical_membase_ is a
+  // separate mmap view of the same backing file as virtual_membase_'s
+  // 0xA0/0xC0/0xE0 aliases, so only the guest-virtual-view range below it is
+  // watched; a direct physical_membase_ access is an intentional bypass
+  // (e.g. data providers). InitializeExternal() has no such separate view --
+  // physical_membase_ is virtual_membase_ + 0xA0000000, the same host bytes
+  // x360rt itself writes through -- so that range would also need handling
+  // here for a write-watch fault to resolve correctly. Currently unreached
+  // for an InitializeExternal() instance (it never installs the MMIOHandler
+  // that would route a real SIGSEGV here -- see InitializeExternal's own
+  // comment); kept correct so that decision can change without this
+  // function's logic being wrong.
+  bool IsWatchableFaultAddress(const void* host_address) const;
+
   std::filesystem::path file_name_;
   uint32_t system_page_size_ = 0;
   uint32_t system_allocation_granularity_ = 0;
   uint8_t* virtual_membase_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
+  // Set by InitializeExternal(); see IsWatchableFaultAddress and
+  // InitializeExternal's own doc comment for what this changes.
+  bool external_mode_ = false;
 
   struct FunctionTableEntry {
     uint32_t table_base;

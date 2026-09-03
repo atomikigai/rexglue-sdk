@@ -29,6 +29,7 @@
 #include <rex/runtime.h>
 #include <rex/system/export_resolver.h>
 
+#include "codegen_language.h"
 #include "codegen_logging.h"
 #include "file_io.h"
 #include "template_registry_internal.h"
@@ -79,6 +80,20 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
     });
   }
 
+  // Count of functions the C backend's init_c.inja actually emits into
+  // PPCFuncMappings (same filter as its `{% if not fn.below_code_base or
+  // fn.is_import %}` loop guard): x360rt/ppc.h's PPCImageInfo.func_mapping_count
+  // must match exactly, since x360_ppc_install_mappings/binary search iterate
+  // [0, func_mapping_count) rather than scanning for a sentinel entry.
+  size_t funcMappingCount = 0;
+  for (const auto* fn : functions) {
+    bool belowCodeBase = fn->base() < codeMin;
+    bool isImport = fn->authority() == rex::codegen::FunctionAuthority::IMPORT;
+    if (!belowCodeBase || isImport) {
+      funcMappingCount++;
+    }
+  }
+
   // Build config flags
   nlohmann::json configFlags = {
       {"skip_lr", cfg.skipLr},
@@ -101,10 +116,36 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"thunk_reserve_size", fmt::format("0x{:X}", 0x10000u)},
       {"has_dll_modules", ctx.hasDllModules()},
       {"is_dll", ctx.isDllModule()},
+      {"func_mapping_count", funcMappingCount},
       {"config_flags", configFlags},
       {"functions", functionsJson},
       {"recomp_files", nlohmann::json::array()},
   };
+}
+
+// Resolves the display name emission uses for the function at `address`:
+// its explicit name if one was set (rexcrt rename, CONFIG override, ...),
+// else the same "sub_<addr>" default codegen_writer's own functionsJson
+// loop above falls back to. Shared so export thunk bodies call the exact
+// symbol the target function is actually emitted under.
+std::string resolveTargetFunctionName(const rex::codegen::FunctionGraph& graph, uint32_t address) {
+  if (auto* node = graph.getFunction(address); node && !node->name().empty()) {
+    return node->name();
+  }
+  return fmt::format("sub_{:08X}", address);
+}
+
+nlohmann::json buildExportThunksJson(
+    const std::vector<rex::codegen::ExportThunkInfo>& exportThunks,
+    const rex::codegen::FunctionGraph& graph) {
+  nlohmann::json thunksJson = nlohmann::json::array();
+  for (const auto& thunk : exportThunks) {
+    thunksJson.push_back({
+        {"thunk_name", thunk.thunkName},
+        {"target_name", resolveTargetFunctionName(graph, thunk.targetAddress)},
+    });
+  }
+  return thunksJson;
 }
 
 }  // namespace
@@ -116,7 +157,7 @@ bool IsGeneratedOutputName(std::string_view filename, std::string_view projectNa
   if (dot == std::string_view::npos)
     return false;
   auto ext = filename.substr(dot);
-  if (ext != ".cpp" && ext != ".h" && ext != ".cmake")
+  if (ext != ".cpp" && ext != ".c" && ext != ".h" && ext != ".cmake")
     return false;
 
   if (filename == "sources.cmake")
@@ -210,9 +251,17 @@ bool CodegenWriter::write(bool force) {
 
   auto tmplData = buildTemplateData(ctx_, functions, rexcrtByAddr);
 
+  // Output language selection: --lang/[project].language resolve to this
+  // before write() runs (see codegen_command.cpp / codegen_language.h). Cpp
+  // is the default and produces byte-identical output to before.
+  const auto lang = GetCodegenLanguage();
+  const char* ext = LanguageSourceExt(lang);
+  const bool isC = lang == Language::C;
+  tmplData["source_ext"] = ext;
+
   // Generate {project}_pch.h (config + macros, stable enough to precompile)
   REXCODEGEN_TRACE("Recompile: generating {}_pch.h", projectName);
-  out = renderWithJson(registry, "codegen/pch_h", tmplData);
+  out = renderWithJson(registry, isC ? "codegen/pch_h_c" : "codegen/pch_h", tmplData);
   SaveCurrentOutData(fmt::format("{}_pch.h", projectName));
 
   // Generate {project}_funcs.h (every guest function declaration)
@@ -220,21 +269,21 @@ bool CodegenWriter::write(bool force) {
   out = renderWithJson(registry, "codegen/funcs_h", tmplData);
   SaveCurrentOutData(fmt::format("{}_funcs.h", projectName));
 
-  // Generate {project}_init.h (the full surface, for init.cpp and consumers)
+  // Generate {project}_init.h (the full surface, for init.{ext} and consumers)
   REXCODEGEN_TRACE("Recompile: generating {}_init.h", projectName);
   out = renderWithJson(registry, "codegen/init_h", tmplData);
   SaveCurrentOutData(fmt::format("{}_init.h", projectName));
 
-  // Generate {project}_init.cpp (PPCImageConfig + PPCFuncMappings)
-  REXCODEGEN_TRACE("Recompile: generating {}_init.cpp", projectName);
-  out = renderWithJson(registry, "codegen/init_cpp", tmplData);
-  SaveCurrentOutData(fmt::format("{}_init.cpp", projectName));
+  // Generate {project}_init.{ext} (PPCImageConfig + PPCFuncMappings)
+  REXCODEGEN_TRACE("Recompile: generating {}_init.{}", projectName, ext);
+  out = renderWithJson(registry, isC ? "codegen/init_c" : "codegen/init_cpp", tmplData);
+  SaveCurrentOutData(fmt::format("{}_init.{}", projectName, ext));
 
-  // Generate {project}_register.cpp (registration function for hash-based dispatch)
-  REXCODEGEN_TRACE("Recompile: generating {}_register.cpp", projectName);
+  // Generate {project}_register.{ext} (registration function for hash-based dispatch)
+  REXCODEGEN_TRACE("Recompile: generating {}_register.{}", projectName, ext);
   tmplData["is_dll"] = ctx_.isDllModule();
-  out = renderWithJson(registry, "codegen/register_cpp", tmplData);
-  SaveCurrentOutData(fmt::format("{}_register.cpp", projectName));
+  out = renderWithJson(registry, isC ? "codegen/register_c" : "codegen/register_cpp", tmplData);
+  SaveCurrentOutData(fmt::format("{}_register.{}", projectName, ext));
 
   // Filter out imports and rexcrt functions before recompilation
   std::erase_if(functions, [](const FunctionNode* fn) {
@@ -298,7 +347,7 @@ bool CodegenWriter::write(bool force) {
     for (size_t entry : buckets[index]) {
       out += bodies[entry];
     }
-    SaveCurrentOutData(fmt::format("{}_recomp.{}.cpp", projectName, index));
+    SaveCurrentOutData(fmt::format("{}_recomp.{}.{}", projectName, index, ext));
   }
 
   out = partition.Serialize();
@@ -306,13 +355,29 @@ bool CodegenWriter::write(bool force) {
 
   REXCODEGEN_TRACE("Recompilation complete.");
 
+  // Generate {project}_export_thunks.{ext} (guest-to-guest export forwarding,
+  // see phase_register.cpp's registerExportThunks()). Only emitted when this
+  // binary actually has exports a sibling [[modules]] DLL might import.
+  bool hasExportThunks = !ctx_.exportThunks.empty();
+  if (hasExportThunks) {
+    REXCODEGEN_TRACE("Recompile: generating {} export forwarding thunk(s) for {}",
+                     ctx_.exportThunks.size(), projectName);
+    tmplData["export_thunks"] = buildExportThunksJson(ctx_.exportThunks, graph());
+    out = renderWithJson(registry, isC ? "codegen/export_thunks_c" : "codegen/export_thunks_cpp",
+                         tmplData);
+    SaveCurrentOutData(fmt::format("{}_export_thunks.{}", projectName, ext));
+  }
+
   // Generate sources.cmake
   REXCODEGEN_TRACE("Recompile: generating sources.cmake");
   {
     auto& recompFiles = tmplData["recomp_files"];
     recompFiles = nlohmann::json::array();
     for (size_t i = 0; i < buckets.size(); ++i) {
-      recompFiles.push_back(fmt::format("{}_recomp.{}.cpp", projectName, i));
+      recompFiles.push_back(fmt::format("{}_recomp.{}.{}", projectName, i, ext));
+    }
+    if (hasExportThunks) {
+      recompFiles.push_back(fmt::format("{}_export_thunks.{}", projectName, ext));
     }
     out = renderWithJson(registry, "codegen/sources_cmake", tmplData);
     SaveCurrentOutData("sources.cmake");

@@ -1,0 +1,17 @@
+// C11 variant of export_thunks_cpp.inja. See that file's header comment for
+// why these thunks exist; PPCContext/u8 come from x360rt/ppc.h via
+// {{ project }}_pch.h, same as every other generated file.
+
+#include "{{ project }}_init.h"
+
+#ifdef _WIN32
+#define REX_EXPORT_THUNK __declspec(dllexport)
+#else
+#define REX_EXPORT_THUNK __attribute__((visibility("default")))
+#endif
+
+{% for thunk in export_thunks %}REX_EXPORT_THUNK
+void __imp__{{ thunk.thunk_name }}(PPCContext* restrict ctx, u8* base) {
+  {{ thunk.target_name }}(ctx, base);
+}
+{% endfor %}

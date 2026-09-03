@@ -27,6 +27,7 @@ class WindowedAppContext;
 }  // namespace rex::ui
 namespace rex::system {
 class KernelState;
+class IGpuHost;
 }
 
 namespace rex::system {
@@ -47,6 +48,19 @@ class IGraphicsSystem {
   // SetupPresentation has not been called, a headless provider is built.
   virtual X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
                                  KernelState* kernel_state) = 0;
+
+  // Host-abstracted equivalent of the overload above (see
+  // rex/graphics/gpu_host.h), for guest-GPU integrations that have no
+  // FunctionDispatcher/KernelState -- e.g. x360recomp's C11 runtime through
+  // rexglue-sdk's C shim. GraphicsSystem implements this with the real
+  // SetupGuestGpu logic and reimplements the FunctionDispatcher/KernelState
+  // overload on top of it via an internal SdkGpuHost adapter, so existing
+  // callers (rex_app/Runtime) are unaffected. Default: not implemented, for
+  // any other IGraphicsSystem the SDK might grow that does not opt in.
+  virtual X_STATUS SetupGuestGpu(IGpuHost* gpu_host) {
+    (void)gpu_host;
+    return X_STATUS_NOT_IMPLEMENTED;
+  }
 
   virtual bool has_presentation() const = 0;
 

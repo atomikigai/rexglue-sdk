@@ -252,6 +252,74 @@ bool Memory::Initialize() {
   return true;
 }
 
+bool Memory::InitializeExternal(uint8_t* external_membase) {
+  if (!external_membase) {
+    REXSYS_ERROR("InitializeExternal: external_membase is null");
+    return false;
+  }
+
+  external_mode_ = true;
+  virtual_membase_ = external_membase;
+  physical_membase_ = external_membase + 0xA0000000u;
+
+  REXSYS_INFO(
+      "Guest memory arena mirrored from external host: virtual base 0x{:016X}, physical base "
+      "0x{:016X} (owned by the caller, not mmap'd here)",
+      reinterpret_cast<uintptr_t>(virtual_membase_), reinterpret_cast<uintptr_t>(physical_membase_));
+
+  // Bookkeeping-only for LookupHeap()/Dispose() safety; nothing in the GPU
+  // shared-memory path (SharedMemory/PrimitiveProcessor/TextureCache) reads
+  // guest virtual addresses through this Memory instance.
+  heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
+                              0x40000000, 4096);
+  heaps_.v40000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x40000000,
+                              0x40000000 - 0x01000000, 64 * 1024);
+  heaps_.v80000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x80000000,
+                              0x10000000, 64 * 1024);
+  heaps_.v90000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x90000000,
+                              0x10000000, 4096);
+
+  heaps_.physical.Initialize(this, physical_membase_, memory::HeapType::kGuestPhysical, 0x00000000,
+                             0x20000000, 4096);
+  heaps_.vA0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xA0000000,
+                              0x20000000, 64 * 1024, &heaps_.physical);
+  // Bookkeeping-only, like the virtual heaps above: x360rt does not alias
+  // 0xC0000000/0xE0000000 onto the same physical bytes as 0xA0000000 yet
+  // (runtime/src/mem/mem_core.c's x360_mem_translate_physical only knows the
+  // 0xA0 view), so real guest writes never reach these two heaps' host
+  // range in this mode.
+  heaps_.vC0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xC0000000,
+                              0x20000000, 16 * 1024 * 1024, &heaps_.physical);
+  heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
+                              0x1FD00000, 4096, &heaps_.physical);
+
+  // Mirror mode: mark the whole guest-physical range as reserved+committed+
+  // read/write in this Memory's own page-table bookkeeping up front, so
+  // QueryProtect/QueryRegionInfo/GetPhysicalAddress report sane results for
+  // it (x360rt owns real guest allocation independently -- see
+  // runtime/src/mem/mem_heap.c -- so nothing ever calls Alloc/AllocFixed on
+  // these heaps for individual guest allocations). The rex::memory::Protect
+  // call this issues is itself a no-op on x360rt's memory (already
+  // read/write from a single mmap - see mem_core.c), matching this mode's
+  // documented commit/protect delegation.
+  //
+  // Deliberately does NOT install an MMIOHandler / SIGSEGV write-watch (see
+  // EnablePhysicalMemoryAccessCallbacks below): unlike Initialize()'s own
+  // arena, the pages mirrored here may be written by machine code this
+  // process did not compile (x360rt's own PPC->host recompiler output), so
+  // trusting rex::system::ExceptionHandler's x86 store-instruction decoder
+  // (mmio_handler.cpp) to recognize every store shape that recompiler emits
+  // is not a safe assumption to make from this module alone.
+  if (!heaps_.vA0000000.AllocFixed(0xA0000000u, 0x20000000u, 64 * 1024,
+                                   memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+                                   memory::kMemoryProtectRead | memory::kMemoryProtectWrite)) {
+    REXSYS_ERROR("InitializeExternal: failed to mirror the physical heap as committed");
+    return false;
+  }
+
+  return true;
+}
+
 static const struct {
   uint64_t virtual_address_start;
   uint64_t virtual_address_end;
@@ -531,13 +599,24 @@ runtime::MMIORange* Memory::LookupVirtualMappedRange(uint32_t virtual_address) {
   return mmio_handler_->LookupRange(virtual_address);
 }
 
-bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
-                                     void* host_address, bool is_write) {
+bool Memory::IsWatchableFaultAddress(const void* host_address) const {
+  const auto addr = reinterpret_cast<size_t>(host_address);
+  const auto virtual_base = reinterpret_cast<size_t>(virtual_membase_);
+  if (external_mode_) {
+    // No separate bypass view exists (see InitializeExternal's doc comment):
+    // the whole 4 GiB arena, including the aliased physical range, must be
+    // handled here.
+    return addr >= virtual_base && addr < virtual_base + 0x100000000ull;
+  }
   // Access via physical_membase_ is special, when need to bypass everything
   // (for instance, for a data provider to actually write the data) so only
   // triggering callbacks on virtual memory regions.
-  if (reinterpret_cast<size_t>(host_address) < reinterpret_cast<size_t>(virtual_membase_) ||
-      reinterpret_cast<size_t>(host_address) >= reinterpret_cast<size_t>(physical_membase_)) {
+  return addr >= virtual_base && addr < reinterpret_cast<size_t>(physical_membase_);
+}
+
+bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> global_lock_locked_once,
+                                     void* host_address, bool is_write) {
+  if (!IsWatchableFaultAddress(host_address)) {
     return false;
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
@@ -682,6 +761,16 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
                                                  bool enable_invalidation_notifications,
                                                  bool enable_data_providers) {
+  if (external_mode_) {
+    // Documented no-op in InitializeExternal's mode: no MMIOHandler is
+    // installed to service the write faults this would otherwise arm (see
+    // InitializeExternal's own comment), so protecting these pages here
+    // would turn a genuine guest write into an unhandled SIGSEGV instead of
+    // a tracked invalidation. Callers that need fresh data every frame
+    // (e.g. the GPU shim, see x360_gpu_shim_swap) call
+    // GraphicsSystem::InvalidateGpuMemory() instead of relying on this.
+    return;
+  }
   heaps_.vA0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vC0000000.EnableAccessCallbacks(physical_address, length,

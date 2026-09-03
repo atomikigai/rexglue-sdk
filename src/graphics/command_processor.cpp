@@ -136,13 +136,9 @@ bool CommandProcessor::Initialize() {
   }
 
   worker_running_ = true;
-  worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-        WorkerThreadMain();
-        return 0;
-      }));
-  worker_thread_->set_name("GPU Commands");
-  worker_thread_->Create();
+  worker_thread_ = graphics_system_->gpu_host()->CreateHostThread(
+      "GPU Commands",
+      [](void* user) { static_cast<CommandProcessor*>(user)->WorkerThreadMain(); }, this);
 
   return true;
 }
@@ -150,19 +146,30 @@ bool CommandProcessor::Initialize() {
 void CommandProcessor::Shutdown() {
   worker_running_ = false;
   write_ptr_index_event_->Set();
-  worker_thread_->Wait(0, 0, 0, nullptr);
+  worker_thread_->Join();
   worker_thread_.reset();
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                uint32_t title_id, bool blocking) {}
 
+bool CommandProcessor::HasPendingFns() {
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  return !pending_fns_.empty();
+}
+
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
-    fn();
-  } else {
-    pending_fns_.push(std::move(fn));
+  bool run_inline = false;
+  if (std::this_thread::get_id() == worker_thread_id_) {
+    std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+    run_inline = pending_fns_.empty();
   }
+  if (run_inline) {
+    fn();
+    return;
+  }
+  std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+  pending_fns_.push(std::move(fn));
 }
 
 void CommandProcessor::ClearCaches() {}
@@ -198,15 +205,23 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+  worker_thread_id_ = std::this_thread::get_id();
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
 
   while (worker_running_) {
-    while (!pending_fns_.empty()) {
-      auto fn = std::move(pending_fns_.front());
-      pending_fns_.pop();
+    for (;;) {
+      std::function<void()> fn;
+      {
+        std::lock_guard<std::mutex> lock(pending_fns_mutex_);
+        if (pending_fns_.empty()) {
+          break;
+        }
+        fn = std::move(pending_fns_.front());
+        pending_fns_.pop();
+      }
       fn();
     }
 
@@ -229,10 +244,10 @@ void CommandProcessor::WorkerThreadMain() {
         rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !HasPendingFns() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || HasPendingFns()) {
         continue;
       }
     }
@@ -244,7 +259,7 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+      memory::store_and_swap<uint32_t>(graphics_system_->gpu_host()->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
     }
 
@@ -276,7 +291,7 @@ void CommandProcessor::Resume() {
   }
   paused_ = false;
 
-  worker_thread_->thread()->Resume();
+  worker_thread_->Resume();
 }
 
 bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
@@ -366,7 +381,7 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      memory::store_and_swap<uint32_t>(graphics_system_->gpu_host()->TranslatePhysical(mem_addr), value);
     }
   } else {
     switch (index) {
@@ -616,7 +631,7 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+  memory::RingBuffer reader(graphics_system_->gpu_host()->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
   do {
@@ -637,7 +652,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
 
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  memory::RingBuffer reader(graphics_system_->gpu_host()->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
@@ -651,7 +666,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
   // Execute commands!
-  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  memory::RingBuffer reader(graphics_system_->gpu_host()->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
   do {
     if (!ExecutePacket(&reader)) {
@@ -958,6 +973,18 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  // memory_.EnablePhysicalMemoryAccessCallbacks (SharedMemory's usual
+  // mprotect-based re-upload skip) is a documented no-op for an
+  // InitializeExternal() Memory (see its own comment): force a full
+  // re-upload once per processed swap instead, so a subsequent frame's
+  // guest writes are not missed just because no write-fault ever fires for
+  // them. Known limitation: per-swap granularity, not per-write -- a page
+  // written twice between two swaps is only ever picked up once. No effect
+  // on the normal (non-external) path.
+  if (memory_ && memory_->is_external()) {
+    InvalidateGpuMemory();
+  }
+
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -994,7 +1021,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     uint32_t value = 0;
     if (is_memory) {
       value =
-          *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+          *reinterpret_cast<uint32_t*>(graphics_system_->gpu_host()->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -1094,7 +1121,7 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  memory::store(graphics_system_->gpu_host()->TranslatePhysical(mem_addr), reg_val);
 
   return true;
 }
@@ -1108,7 +1135,7 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    memory::store(graphics_system_->gpu_host()->TranslatePhysical(addr), write_data);
     write_addr += 4;
   }
 
@@ -1129,7 +1156,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
-    value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
+    value = memory::load<uint32_t>(graphics_system_->gpu_host()->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
     // Register.
@@ -1169,7 +1196,7 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      memory::store(graphics_system_->gpu_host()->TranslatePhysical(write_reg_addr), write_data);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -1214,7 +1241,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  memory::store(graphics_system_->gpu_host()->TranslatePhysical(address), data_value);
   return true;
 }
 
@@ -1241,7 +1268,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
+  memory::copy_and_swap_16_unaligned(graphics_system_->gpu_host()->TranslatePhysical(address), extents,
                                      rex::countof(extents));
   return true;
 }
@@ -1260,8 +1287,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   // As a workaround report some fixed amount of passed samples.
   auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
   if (fake_sample_count >= 0) {
-    auto* pSampleCounts = memory_->TranslatePhysical<xe_gpu_depth_sample_counts*>(
-        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]);
+    auto* pSampleCounts = reinterpret_cast<xe_gpu_depth_sample_counts*>(
+        graphics_system_->gpu_host()->TranslatePhysical(
+            register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR]));
     if (!pSampleCounts) {
       return true;
     }
@@ -1479,7 +1507,8 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
-  uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
+  uint32_t* xlat_address =
+      reinterpret_cast<uint32_t*>(graphics_system_->gpu_host()->TranslatePhysical(address));
   switch (type) {
     case 0:  // ALU
       WriteALURangeFromMem(index, xlat_address, size_dwords);
@@ -1524,8 +1553,10 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
+  auto shader = LoadShader(
+      shader_type, addr,
+      reinterpret_cast<uint32_t*>(graphics_system_->gpu_host()->TranslatePhysical(addr)),
+      size_dwords);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;

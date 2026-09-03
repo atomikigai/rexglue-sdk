@@ -1,0 +1,33 @@
+//=============================================================================
+// ReXGlue Generated - {{ project }} Guest-to-Guest Export Forwarding
+//
+// One small forwarding function per XEX export ordinal this module exposes,
+// so a sibling [[modules]] DLL that imports from this module by ordinal (a
+// guest-DLL-to-guest-DLL import - see rexglue-sdk's
+// src/codegen/phase_register.cpp registerEntryPoints()/registerExportThunks())
+// resolves to real recompiled code at link time instead of an unresolved
+// sub_<thunk> stub. Named "__imp__<module>_ord_<ordinal>" to match exactly
+// what the importing module's own Register phase resolves the ordinal to
+// (ExportResolver::GetExportByOrdinal(), registered by
+// ProjectRecompiler::Run() before Analyze runs).
+//
+// Marked with default visibility even though this module's shared library
+// target builds with hidden visibility (CXX_VISIBILITY_PRESET hidden in
+// dll_targets_cmake.inja): these are the only symbols meant to cross the
+// .so boundary between sibling modules, linked via that same template's
+// target_link_libraries(<consumer> PRIVATE <this module>).
+//=============================================================================
+
+#include "{{ project }}_init.h"
+
+#ifdef _WIN32
+#define REX_EXPORT_THUNK __declspec(dllexport)
+#else
+#define REX_EXPORT_THUNK __attribute__((visibility("default")))
+#endif
+
+{% for thunk in export_thunks %}extern "C" REX_EXPORT_THUNK void __imp__{{ thunk.thunk_name }}(
+    PPCContext& __restrict ctx, uint8_t* base) {
+  {{ thunk.target_name }}(ctx, base);
+}
+{% endfor %}

@@ -100,10 +100,18 @@ class XSocket : public XObject {
   X_STATUS Close();
 
   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
+  // Mirror of SetOption for NetDll_getsockopt: `optval_ptr` receives the
+  // guest-visible (big-endian) option value, `inout_optlen` is both the
+  // guest's supplied buffer capacity and (on success) the number of bytes
+  // written.
+  X_STATUS GetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t* inout_optlen);
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
 
   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
+  // NetDll_getsockname: the actual host-bound local address (post-bind()),
+  // not adjusted for any `net_port_offset` shift applied at Bind() time.
+  X_STATUS GetSockName(N_XSOCKADDR_IN* out_name);
   X_STATUS Listen(int backlog);
   object_ref<XSocket> Accept(N_XSOCKADDR* name, int* name_len);
   int Shutdown(int how);

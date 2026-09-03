@@ -39,6 +39,43 @@ inline uint64_t compute_mask(uint32_t mstart, uint32_t mstop) {
 }
 
 //=============================================================================
+// Language-Conditional Cast Helper
+//=============================================================================
+
+/**
+ * Emit a functional-style numeric cast: `type(expr)` in C++ (byte-identical
+ * to this backend's long-standing output), `(type)(expr)` in C (C has no
+ * functional-cast syntax). `type` must be a name valid in both languages
+ * (fundamental types, or a <stdint.h> typedef visible in both via the
+ * project's PCH).
+ */
+inline std::string numCast(BuilderContext& ctx, std::string_view type, std::string_view expr) {
+  if (ctx.language() == Language::C)
+    return fmt::format("({})({})", type, expr);
+  return fmt::format("{}({})", type, expr);
+}
+
+/**
+ * Emit `cr6.setFromMask(mask_expr, imm)` in C++ (PPCCRRegister::setFromMask,
+ * include/rex/ppc/context.h:103-117 -- byte-identical to this backend's
+ * long-standing output). C has no member functions, so the C backend calls a
+ * free-function equivalent instead (x360_cr_set_from_mask_ps/_epi8, defined
+ * inline in the C PCH, pch_h_c.inja): `imm == 0xF` selects the
+ * movemask_ps/__m128 overload (4-lane float compares), any other value
+ * (every other call site passes 0xFFFF) selects the movemask_epi8/__m128i
+ * overload (16-lane byte/word compares) -- the only two overloads
+ * setFromMask has, and the only two imm values this codegen ever emits for
+ * it (see builders/vector.cpp's CR6 vector-compare call sites).
+ */
+inline std::string crSetFromMask(BuilderContext& ctx, std::string_view mask_expr, int imm) {
+  if (ctx.language() == Language::C) {
+    const char* fn = (imm == 0xF) ? "x360_cr_set_from_mask_ps" : "x360_cr_set_from_mask_epi8";
+    return fmt::format("{}(&{}, {}, {})", fn, ctx.cr(6), mask_expr, imm);
+  }
+  return fmt::format("{}.setFromMask({}, {})", ctx.cr(6), mask_expr, imm);
+}
+
+//=============================================================================
 // CR Bit Helpers
 //=============================================================================
 
@@ -76,11 +113,34 @@ inline bool isRecordForm(const ppc_insn& insn) {
  *
  * @param ctx The builder context containing the instruction being processed
  */
-inline void emitRecordFormCompare(BuilderContext& ctx) {
-  if (isRecordForm(ctx.insn)) {
-    ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(0), ctx.r(ctx.insn.operands[0]),
+/**
+ * Emit an int32_t compare-to-zero into the given CR field: `crN.compare<int32_t>(reg.s32, 0,
+ * xer)` in C++, `x360_cr_compare_s32(&crN, reg.s32, 0, &xer)` in C. Shared by record-form
+ * ("." suffixed) arithmetic/logical instructions (emitRecordFormCompare) and the two
+ * immediate-form logical instructions that unconditionally set CR0 (andi., andis.).
+ *
+ * @param ctx The builder context
+ * @param crField CR field index (0-7)
+ * @param regExpr Pre-resolved register expression (e.g. from ctx.r(...))
+ */
+inline void emitCompareToZero(BuilderContext& ctx, size_t crField, const std::string& regExpr) {
+  if (ctx.language() == Language::C) {
+    // CRRegister::compare<T> is a C++ template method; the C backend calls a
+    // free-function equivalent instead (defined inline in the C PCH,
+    // pch_h_c.inja). Signature mirrors x360_cr_compare_s64/u64
+    // (x360rt/ppc.h): takes the whole XER so the callee reads xer->so,
+    // matching CRRegister::compare<T>'s semantics.
+    ctx.println("\tx360_cr_compare_s32(&{}, {}.s32, 0, &{});", ctx.cr(crField), regExpr,
                 ctx.xer());
+  } else {
+    ctx.println("\t{}.compare<int32_t>({}.s32, 0, {});", ctx.cr(crField), regExpr, ctx.xer());
   }
+}
+
+inline void emitRecordFormCompare(BuilderContext& ctx) {
+  if (!isRecordForm(ctx.insn))
+    return;
+  emitCompareToZero(ctx, 0, ctx.r(ctx.insn.operands[0]));
 }
 
 /**
@@ -131,6 +191,23 @@ inline void emitCRBitOperation(BuilderContext& ctx, std::string_view op, bool in
 //=============================================================================
 
 /**
+ * Free-function name for a C-mode `x360_cr_compare_*` call, given the same
+ * type_name spelling used by the C++ `compare<T>()` template instantiation.
+ * Defined inline in the C PCH (pch_h_c.inja): s64/u64 mirror x360rt/ppc.h's
+ * own definitions; s32/u32 are this backend's own (x360rt has no 32-bit
+ * guest-visible compare need outside codegen).
+ */
+inline const char* crCompareFuncName(const char* type_name) {
+  if (std::strcmp(type_name, "int64_t") == 0)
+    return "x360_cr_compare_s64";
+  if (std::strcmp(type_name, "uint64_t") == 0)
+    return "x360_cr_compare_u64";
+  if (std::strcmp(type_name, "uint32_t") == 0)
+    return "x360_cr_compare_u32";
+  return "x360_cr_compare_s32";
+}
+
+/**
  * Emit register-to-register comparison.
  *
  * Pattern: crD.compare<T>(rA.field, rB.field, XER)
@@ -141,6 +218,12 @@ inline void emitCRBitOperation(BuilderContext& ctx, std::string_view op, bool in
  * @param field The register field accessor (e.g., "s64", "u32")
  */
 inline void emitCompareRegister(BuilderContext& ctx, const char* type_name, const char* field) {
+  if (ctx.language() == Language::C) {
+    ctx.println("\t{}(&{}, {}.{}, {}.{}, &{});", crCompareFuncName(type_name),
+                ctx.cr(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), field,
+                ctx.r(ctx.insn.operands[2]), field, ctx.xer());
+    return;
+  }
   ctx.println("\t{}.compare<{}>({}.{}, {}.{}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
               ctx.r(ctx.insn.operands[1]), field, ctx.r(ctx.insn.operands[2]), field, ctx.xer());
 }
@@ -158,14 +241,16 @@ inline void emitCompareRegister(BuilderContext& ctx, const char* type_name, cons
  */
 inline void emitCompareImmediate(BuilderContext& ctx, const char* type_name, const char* field,
                                  bool sign_extend) {
-  if (sign_extend) {
-    ctx.println("\t{}.compare<{}>({}.{}, {}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
-                ctx.r(ctx.insn.operands[1]), field, static_cast<int32_t>(ctx.insn.operands[2]),
-                ctx.xer());
-  } else {
-    ctx.println("\t{}.compare<{}>({}.{}, {}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
-                ctx.r(ctx.insn.operands[1]), field, ctx.insn.operands[2], ctx.xer());
+  std::string imm = sign_extend
+                        ? fmt::format("{}", static_cast<int32_t>(ctx.insn.operands[2]))
+                        : fmt::format("{}", ctx.insn.operands[2]);
+  if (ctx.language() == Language::C) {
+    ctx.println("\t{}(&{}, {}.{}, {}, &{});", crCompareFuncName(type_name),
+                ctx.cr(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), field, imm, ctx.xer());
+    return;
   }
+  ctx.println("\t{}.compare<{}>({}.{}, {}, {});", ctx.cr(ctx.insn.operands[0]), type_name,
+              ctx.r(ctx.insn.operands[1]), field, imm, ctx.xer());
 }
 
 //=============================================================================
@@ -304,11 +389,15 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
   ctx.println("{}.u32;", ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.lt = 0;", ctx.cr(0));
   ctx.println("\t{}.gt = 0;", ctx.cr(0));
+  // reinterpret_cast is C++-only; the C backend uses an equivalent C-style
+  // pointer cast, which is byte-identical for reinterpreting an address.
+  std::string castPrefix = ctx.language() == Language::C ? fmt::format("({}*)", ptr_type)
+                                                          : fmt::format("reinterpret_cast<{}*>", ptr_type);
   ctx.println(
-      "\t{}.eq = __sync_bool_compare_and_swap(reinterpret_cast<{}*>(REX_RAW_ADDR({})), "
+      "\t{}.eq = __sync_bool_compare_and_swap({}(REX_RAW_ADDR({})), "
       "{}.{}, {}({}.{}));",
-      ctx.cr(0), ptr_type, ctx.ea(), ctx.reserved(), field, bswap_func, ctx.r(ctx.insn.operands[0]),
-      field);
+      ctx.cr(0), castPrefix, ctx.ea(), ctx.reserved(), field, bswap_func,
+      ctx.r(ctx.insn.operands[0]), field);
   ctx.println("\t{}.so = {}.so;", ctx.cr(0), ctx.xer());
 }
 
@@ -328,10 +417,15 @@ inline void emitAtomicStoreConditional(BuilderContext& ctx, const char* ptr_type
  */
 inline void emitSignExtendLoadDForm(BuilderContext& ctx, const char* cast_type,
                                     const char* load_macro) {
-  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, load_macro);
+  // numCast keeps C++ output byte-identical (functional-style `type(expr)`);
+  // C has no functional-cast syntax, so it gets `(type)(expr)` instead (this
+  // previously hardcoded the C++-only functional form for both languages,
+  // which is a syntax error in C11).
+  std::string addr = fmt::format("{}(", load_macro);
   if (ctx.insn.operands[2] != 0)
-    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
-  ctx.println("{}));", static_cast<int32_t>(ctx.insn.operands[1]));
+    addr += fmt::format("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
+  addr += fmt::format("{})", static_cast<int32_t>(ctx.insn.operands[1]));
+  ctx.println("\t{}.s64 = {};", ctx.r(ctx.insn.operands[0]), numCast(ctx, cast_type, addr));
 }
 
 /**
@@ -346,10 +440,13 @@ inline void emitSignExtendLoadDForm(BuilderContext& ctx, const char* cast_type,
  */
 inline void emitSignExtendLoadXForm(BuilderContext& ctx, const char* cast_type,
                                     const char* load_macro) {
-  ctx.print("\t{}.s64 = {}({}(", ctx.r(ctx.insn.operands[0]), cast_type, load_macro);
+  // See emitSignExtendLoadDForm above: numCast keeps this a functional-style
+  // cast in C++ (byte-identical) and a C-style cast in C (valid C11).
+  std::string addr = fmt::format("{}(", load_macro);
   if (ctx.insn.operands[1] != 0)
-    ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
-  ctx.println("{}.u32));", ctx.r(ctx.insn.operands[2]));
+    addr += fmt::format("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
+  addr += fmt::format("{}.u32)", ctx.r(ctx.insn.operands[2]));
+  ctx.println("\t{}.s64 = {};", ctx.r(ctx.insn.operands[0]), numCast(ctx, cast_type, addr));
 }
 
 //=============================================================================

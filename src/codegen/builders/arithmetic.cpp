@@ -128,9 +128,11 @@ bool build_divw(BuilderContext& ctx) {
   auto rA = ctx.r(ctx.insn.operands[1]);
   auto rB = ctx.r(ctx.insn.operands[2]);
   ctx.println(
-      "\t{}.u64 = uint32_t(({}.s32 && !({}.s32 == INT32_MIN && {}.s32 == -1)) ? {}.s32 / {}.s32 : "
-      "0);",
-      rD, rB, rA, rB, rA, rB);
+      "\t{}.u64 = {};", rD,
+      numCast(ctx, "uint32_t",
+              fmt::format("({0}.s32 && !({1}.s32 == INT32_MIN && {0}.s32 == -1)) ? {1}.s32 / "
+                          "{0}.s32 : 0",
+                          rB, rA)));
   emitRecordFormCompare(ctx);
   return true;
 }
@@ -141,7 +143,8 @@ bool build_divwu(BuilderContext& ctx) {
   auto rD = ctx.r(ctx.insn.operands[0]);
   auto rA = ctx.r(ctx.insn.operands[1]);
   auto rB = ctx.r(ctx.insn.operands[2]);
-  ctx.println("\t{}.u64 = uint32_t({}.u32 ? {}.u32 / {}.u32 : 0);", rD, rB, rA, rB);
+  ctx.println("\t{}.u64 = {};", rD,
+              numCast(ctx, "uint32_t", fmt::format("{0}.u32 ? {1}.u32 / {0}.u32 : 0", rB, rA)));
   emitRecordFormCompare(ctx);
   return true;
 }
@@ -151,23 +154,28 @@ bool build_divwu(BuilderContext& ctx) {
 //=============================================================================
 
 bool build_mulhw(BuilderContext& ctx) {
-  ctx.println("\t{}.s64 = (int64_t({}.s32) * int64_t({}.s32)) >> 32;", ctx.r(ctx.insn.operands[0]),
-              ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]));
+  auto a = ctx.r(ctx.insn.operands[1]);
+  auto b = ctx.r(ctx.insn.operands[2]);
+  ctx.println("\t{}.s64 = ({} * {}) >> 32;", ctx.r(ctx.insn.operands[0]),
+              numCast(ctx, "int64_t", fmt::format("{}.s32", a)),
+              numCast(ctx, "int64_t", fmt::format("{}.s32", b)));
   emitRecordFormCompare(ctx);
   return true;
 }
 
 bool build_mulhwu(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;",
-              ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
-              ctx.r(ctx.insn.operands[2]));
+  // C++ keeps the functional-cast spelling byte-identical to prior output;
+  // functional-style casts are C++-only, so C uses a C-style cast instead.
+  const char* cast64 = ctx.language() == Language::C ? "(uint64_t)" : "uint64_t";
+  ctx.println("\t{}.u64 = ({}({}.u32) * {}({}.u32)) >> 32;", ctx.r(ctx.insn.operands[0]), cast64,
+              ctx.r(ctx.insn.operands[1]), cast64, ctx.r(ctx.insn.operands[2]));
   emitRecordFormCompare(ctx);
   return true;
 }
 
 bool build_mulld(BuilderContext& ctx) {
   // Use unsigned multiplication to avoid signed overflow UB (PPC wraps on overflow)
-  ctx.println("\t{}.s64 = static_cast<int64_t>({}.u64 * {}.u64);", ctx.r(ctx.insn.operands[0]),
+  ctx.println("\t{}.s64 = {}({}.u64 * {}.u64);", ctx.r(ctx.insn.operands[0]), ctx.cast("int64_t"),
               ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]));
   emitRecordFormCompare(ctx);
   return true;
@@ -175,15 +183,18 @@ bool build_mulld(BuilderContext& ctx) {
 
 bool build_mulli(BuilderContext& ctx) {
   // Use unsigned multiplication to avoid signed overflow UB (PPC wraps on overflow)
-  ctx.println("\t{}.s64 = static_cast<int64_t>({}.u64 * static_cast<uint64_t>({}));",
-              ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
+  ctx.println("\t{}.s64 = {}({}.u64 * {}({}));", ctx.r(ctx.insn.operands[0]), ctx.cast("int64_t"),
+              ctx.r(ctx.insn.operands[1]), ctx.cast("uint64_t"),
               static_cast<int32_t>(ctx.insn.operands[2]));
   return true;
 }
 
 bool build_mullw(BuilderContext& ctx) {
-  ctx.println("\t{}.s64 = int64_t({}.s32) * int64_t({}.s32);", ctx.r(ctx.insn.operands[0]),
-              ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]));
+  // C++ keeps the functional-cast spelling byte-identical to prior output;
+  // functional-style casts are C++-only, so C uses a C-style cast instead.
+  const char* cast64 = ctx.language() == Language::C ? "(int64_t)" : "int64_t";
+  ctx.println("\t{}.s64 = {}({}.s32) * {}({}.s32);", ctx.r(ctx.insn.operands[0]), cast64,
+              ctx.r(ctx.insn.operands[1]), cast64, ctx.r(ctx.insn.operands[2]));
   emitRecordFormCompare(ctx);
   return true;
 }
@@ -191,9 +202,11 @@ bool build_mullw(BuilderContext& ctx) {
 bool build_mulhd(BuilderContext& ctx) {
   // mulhd: rD = high 64 bits of (rA * rB) (signed)
   ctx.println(
-      "\t{}.s64 = static_cast<int64_t>((static_cast<__int128>(static_cast<int64_t>({}.s64)) * "
-      "static_cast<__int128>(static_cast<int64_t>({}.s64))) >> 64);",
-      ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]));
+      "\t{}.s64 = {}(({}({}({}.s64)) * "
+      "{}({}({}.s64))) >> 64);",
+      ctx.r(ctx.insn.operands[0]), ctx.cast("int64_t"), ctx.cast("__int128"), ctx.cast("int64_t"),
+      ctx.r(ctx.insn.operands[1]), ctx.cast("__int128"), ctx.cast("int64_t"),
+      ctx.r(ctx.insn.operands[2]));
   emitRecordFormCompare(ctx);
   return true;
 }
@@ -201,9 +214,10 @@ bool build_mulhd(BuilderContext& ctx) {
 bool build_mulhdu(BuilderContext& ctx) {
   // mulhdu: rD = high 64 bits of (rA * rB) (unsigned)
   ctx.println(
-      "\t{}.u64 = static_cast<uint64_t>((static_cast<__uint128_t>({}.u64) * "
-      "static_cast<__uint128_t>({}.u64)) >> 64);",
-      ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]), ctx.r(ctx.insn.operands[2]));
+      "\t{}.u64 = {}(({}({}.u64) * "
+      "{}({}.u64)) >> 64);",
+      ctx.r(ctx.insn.operands[0]), ctx.cast("uint64_t"), ctx.cast("__uint128_t"),
+      ctx.r(ctx.insn.operands[1]), ctx.cast("__uint128_t"), ctx.r(ctx.insn.operands[2]));
   emitRecordFormCompare(ctx);
   return true;
 }
@@ -214,7 +228,7 @@ bool build_mulhdu(BuilderContext& ctx) {
 
 bool build_neg(BuilderContext& ctx) {
   // Use unsigned negation to avoid signed overflow UB when negating INT64_MIN
-  ctx.println("\t{}.s64 = static_cast<int64_t>(-{}.u64);", ctx.r(ctx.insn.operands[0]),
+  ctx.println("\t{}.s64 = {}(-{}.u64);", ctx.r(ctx.insn.operands[0]), ctx.cast("int64_t"),
               ctx.r(ctx.insn.operands[1]));
   emitRecordFormCompare(ctx);
   return true;
@@ -255,7 +269,7 @@ bool build_subfe(BuilderContext& ctx) {
 bool build_subfic(BuilderContext& ctx) {
   ctx.println("\t{}.ca = {}.u32 <= {};", ctx.xer(), ctx.r(ctx.insn.operands[1]),
               ctx.insn.operands[2]);
-  ctx.println("\t{}.u64 = static_cast<uint64_t>({}) - {}.u64;", ctx.r(ctx.insn.operands[0]),
+  ctx.println("\t{}.u64 = {}({}) - {}.u64;", ctx.r(ctx.insn.operands[0]), ctx.cast("uint64_t"),
               static_cast<int32_t>(ctx.insn.operands[2]), ctx.r(ctx.insn.operands[1]));
   return true;
 }

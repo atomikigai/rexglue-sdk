@@ -48,6 +48,15 @@ struct ImportSymbol {
   std::string name;  ///< "libname@ordinal" format
 };
 
+/// Export symbol from this binary's own XEX2 export table (xex2_export_table):
+/// ordinal -> guest function address. Empty when exportTableAddr() is 0 or
+/// the table fails to parse. Used for guest-DLL-to-guest-DLL import
+/// resolution (see rex/codegen/project_recompiler.cpp and phase_register.cpp).
+struct ExportSymbol {
+  uint16_t ordinal;
+  uint32_t address;  ///< Guest address the ordinal resolves to
+};
+
 /// Self-contained binary view that owns all section data
 class BinaryView {
  public:
@@ -89,6 +98,11 @@ class BinaryView {
   /// Import symbols (thunk addresses + names)
   std::span<const ImportSymbol> importSymbols() const { return importSymbols_; }
 
+  /// This binary's own exports (ordinal -> guest address), parsed from
+  /// exportTableAddr() when present. Empty for binaries with no export
+  /// table (e.g. most entrypoint XEXs).
+  std::span<const ExportSymbol> exportSymbols() const { return exportSymbols_; }
+
  public:
   BinaryView() = default;
 
@@ -110,6 +124,9 @@ class BinaryView {
 
   // Import symbols
   std::vector<ImportSymbol> importSymbols_;
+
+  // This binary's own exports (see exportSymbols())
+  std::vector<ExportSymbol> exportSymbols_;
 };
 
 }  // namespace rex::codegen

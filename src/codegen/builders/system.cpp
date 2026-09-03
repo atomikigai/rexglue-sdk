@@ -243,14 +243,14 @@ bool build_mfocrf(BuilderContext& ctx) {
 
 bool build_mflr(BuilderContext& ctx) {
   if (!ctx.config().skipLr)
-    ctx.println("\t{}.u64 = ctx.lr;", ctx.r(ctx.insn.operands[0]));
+    ctx.println("\t{}.u64 = {}lr;", ctx.r(ctx.insn.operands[0]), ctx.ctxPrefix());
   return true;
 }
 
 bool build_mfmsr(BuilderContext& ctx) {
   if (!ctx.config().skipMsr) {
     // Memory barrier for MSR read
-    ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+    ctx.println("\t{}atomic_thread_fence({}memory_order_seq_cst);", ctx.cppNs(), ctx.cppNs());
     // Check global lock and return appropriate value
     // Returns 0x8000 if unlocked (interrupts enabled), 0 if locked
     ctx.println("\t{}.u64 = REX_CHECK_GLOBAL_LOCK();", ctx.r(ctx.insn.operands[0]));
@@ -259,7 +259,14 @@ bool build_mfmsr(BuilderContext& ctx) {
 }
 
 bool build_mffs(BuilderContext& ctx) {
-  ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost();", ctx.f(ctx.insn.operands[0]));
+  if (ctx.language() == Language::C) {
+    // FPSCRRegister::loadFromHost() is a C++-only method; the C backend
+    // calls the free-function equivalent (defined inline in the C PCH,
+    // pch_h_c.inja) instead.
+    ctx.println("\t{}.u64 = x360_fpscr_load_from_host(&ctx->fpscr);", ctx.f(ctx.insn.operands[0]));
+  } else {
+    ctx.println("\t{}.u64 = ctx.fpscr.loadFromHost();", ctx.f(ctx.insn.operands[0]));
+  }
   return true;
 }
 
@@ -311,16 +318,16 @@ bool build_mtctr(BuilderContext& ctx) {
 
 bool build_mtlr(BuilderContext& ctx) {
   if (!ctx.config().skipLr)
-    ctx.println("\tctx.lr = {}.u64;", ctx.r(ctx.insn.operands[0]));
+    ctx.println("\t{}lr = {}.u64;", ctx.ctxPrefix(), ctx.r(ctx.insn.operands[0]));
   return true;
 }
 
 bool build_mtmsrd(BuilderContext& ctx) {
   if (!ctx.config().skipMsr) {
     // Memory barrier for MSR write
-    ctx.println("\tstd::atomic_thread_fence(std::memory_order_seq_cst);");
+    ctx.println("\t{}atomic_thread_fence({}memory_order_seq_cst);", ctx.cppNs(), ctx.cppNs());
     // Update MSR bits
-    ctx.println("\tctx.msr = ({}.u32 & 0x8020) | (ctx.msr & ~0x8020);",
+    ctx.println("\t{0}msr = ({1}.u32 & 0x8020) | ({0}msr & ~0x8020);", ctx.ctxPrefix(),
                 ctx.r(ctx.insn.operands[0]));
     // Global lock mechanism:
     // R13 = enter lock (disable interrupts)
@@ -342,8 +349,21 @@ bool build_mtfsf(BuilderContext& ctx) {
     if (fm & (1 << (7 - j)))
       mask |= 0xF << (4 * j);
   }
+  // FPSCRRegister::loadFromHost()/storeFromGuest() are C++-only methods; the
+  // C backend calls the free-function equivalents (defined inline in the C
+  // PCH, pch_h_c.inja) instead.
+  bool isC = ctx.language() == Language::C;
   if (mask == 0xFFFFFFFF) {
-    ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
+    if (isC)
+      ctx.println("\tx360_fpscr_store_from_guest(&ctx->fpscr, {}.u32);",
+                  ctx.f(ctx.insn.operands[1]));
+    else
+      ctx.println("\tctx.fpscr.storeFromGuest({}.u32);", ctx.f(ctx.insn.operands[1]));
+  } else if (isC) {
+    ctx.println(
+        "\tx360_fpscr_store_from_guest(&ctx->fpscr, (x360_fpscr_load_from_host(&ctx->fpscr) & "
+        "0x{:08X}) | ({}.u32 & 0x{:08X}));",
+        ~mask, ctx.f(ctx.insn.operands[1]), mask);
   } else {
     ctx.println(
         "\tctx.fpscr.storeFromGuest((ctx.fpscr.loadFromHost() & 0x{:08X}) | ({}.u32 & 0x{:08X}));",

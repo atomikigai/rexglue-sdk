@@ -83,6 +83,13 @@ struct RecompilerConfig {
   std::string outDirectoryPath;     ///< Output directory for generated code
   std::string templateDir;          ///< Optional custom template directory for overrides
 
+  /// Output language override ("cpp" or "c"); nullopt = process default
+  /// (the codegen_language cvar, set via `--lang` or left at "cpp"). Parsed
+  /// from a binary table's own `language` key when present, or threaded down
+  /// from the manifest's `[project].language` by ManifestConfig::Load()
+  /// (include/rex/codegen/manifest.h) when the binary itself doesn't set one.
+  std::optional<std::string> language;
+
   /// Every TOML that fed this config, in load order. LoadFromTable() gets a
   /// parsed table, so a manifest-embedded entry omits the manifest itself.
   std::vector<std::string> loadedFiles;

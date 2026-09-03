@@ -12,7 +12,9 @@
 #include <rex/codegen/project_recompiler.h>
 
 #include <algorithm>
+#include <deque>
 #include <filesystem>
+#include <set>
 #include <span>
 #include <unordered_map>
 
@@ -32,12 +34,15 @@
 #include <rex/kernel/init.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
+#include <rex/string.h>
+#include <rex/system/export_resolver.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xex_module.h>
 
 #include <chrono>
 
 #include "codegen_flags.h"
+#include "codegen_language.h"
 #include "codegen_logging.h"
 #include "file_io.h"
 #include "template_registry_internal.h"
@@ -119,6 +124,98 @@ void ReportBinaryInfo(ProgressReporter* reporter, std::string_view display_name,
   reporter->binaryInfo(info);
 }
 
+struct ModuleEntry {
+  std::string targetName;
+  std::string guestPath;
+  bool isDll;
+  RecompilerConfig config;
+};
+
+struct ContextEntry {
+  CodegenContext ctx;
+  const ModuleEntry* module;
+  std::string display_name;
+};
+
+// Guest-to-guest export forwarding: which sibling DLL [[modules]] does each
+// context import from by ordinal? Computed directly from
+// BinaryView::importSymbols() (available as soon as contexts are built)
+// rather than from Analyze() output, so it stays correct even when a
+// context's Analyze() call is skipped for being up to date (see the skip[]
+// loop in Run() - Register phase state would otherwise be stale/empty for a
+// module untouched this run, silently dropping a needed
+// target_link_libraries() edge in dll_targets_cmake.inja). Index 0 (the
+// entrypoint) is always empty; indices [1, contexts.size()) line up with
+// dllModules/targeted[1..].
+std::vector<std::set<std::string>> ComputeGuestModuleDependencies(
+    const std::vector<ContextEntry>& contexts) {
+  std::vector<std::set<std::string>> dependencies(contexts.size());
+  for (size_t i = 1; i < contexts.size(); ++i) {
+    for (const auto& sym : contexts[i].ctx.binary().importSymbols()) {
+      auto atPos = sym.name.find('@');
+      if (atPos == std::string::npos)
+        continue;
+      auto libName = sym.name.substr(0, atPos);
+      for (size_t j = 1; j < contexts.size(); ++j) {
+        if (i == j)
+          continue;
+        const auto& providerName = contexts[j].module->targetName;
+        if (libName.size() == providerName.size() &&
+            rex::string::utf8_starts_with_case(libName, providerName)) {
+          dependencies[i].insert(providerName);
+          break;
+        }
+      }
+    }
+  }
+  return dependencies;
+}
+
+// Registers each DLL context's own XEX export table into the shared
+// resolver under its manifest target name, so phase_register.cpp's existing
+// ExportResolver::GetExportByOrdinal() lookup resolves a sibling's
+// guest-to-guest import to a stable "<module>_ord_<ordinal>" name instead of
+// falling back to an unresolved sub_<thunk> stub. `storage` and `tables`
+// must outlive both the Analyze and Write loops in Run(): the resolver only
+// borrows the pointers it is given.
+void RegisterGuestExportTables(std::vector<ContextEntry>& contexts, runtime::ExportResolver* resolver,
+                               std::deque<runtime::Export>& storage,
+                               std::vector<std::vector<runtime::Export*>>& tables) {
+  tables.reserve(contexts.size());
+  for (size_t i = 1; i < contexts.size(); ++i) {
+    auto& entry = contexts[i];
+    // Sanitized once here and reused for every "<name>_ord_<n>" symbol this
+    // module's thunks are named after (both the Export entries registered
+    // below and, symmetrically, phase_register.cpp's own forwarding thunk
+    // definitions via ctx.exportModuleName()) - a manifest target name like
+    // "WaveShell-Xbox" is not itself a valid C++ identifier.
+    std::string exportName = ToIdentifier(entry.module->targetName);
+    entry.ctx.setExportModuleName(exportName);
+
+    auto exportSymbols = entry.ctx.binary().exportSymbols();
+    if (exportSymbols.empty())
+      continue;
+
+    uint32_t maxOrdinal = 0;
+    for (const auto& exp : exportSymbols)
+      maxOrdinal = std::max(maxOrdinal, static_cast<uint32_t>(exp.ordinal));
+
+    tables.emplace_back(maxOrdinal + 1, nullptr);
+    auto& table = tables.back();
+    for (const auto& exp : exportSymbols) {
+      auto expName = fmt::format("{}_ord_{}", exportName, exp.ordinal);
+      storage.emplace_back(exp.ordinal, runtime::Export::Type::kFunction, expName.c_str(),
+                           runtime::ExportTag::kImplemented);
+      table[exp.ordinal] = &storage.back();
+    }
+    // RegisterTable's own module_name matching (ExportResolver::GetExportByOrdinal,
+    // case-insensitive prefix) must stay keyed by the *unsanitized* target
+    // name: that is what a sibling's import lib_name (parsed straight from
+    // the PE import table) actually looks like.
+    resolver->RegisterTable(entry.module->targetName, &table);
+  }
+}
+
 }  // namespace
 
 ProjectRecompiler::ProjectRecompiler(ManifestConfig manifest) : manifest_(std::move(manifest)) {}
@@ -136,13 +233,6 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     REXCODEGEN_TRACE("Recompiling '{}' (entrypoint + {} DLL{})", manifest_.projectName,
                      manifest_.modules.size(), manifest_.modules.size() == 1 ? "" : "s");
   }
-
-  struct ModuleEntry {
-    std::string targetName;
-    std::string guestPath;
-    bool isDll;
-    RecompilerConfig config;
-  };
 
   std::vector<ModuleEntry> allModules;
   allModules.push_back({DeriveTargetNameFromFilePath(manifest_.entrypoint.recompiler.filePath), "",
@@ -292,11 +382,6 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     dllModules.push_back(std::move(userMod));
   }
 
-  struct ContextEntry {
-    CodegenContext ctx;
-    const ModuleEntry* module;
-    std::string display_name;
-  };
   std::vector<ContextEntry> contexts;
 
   auto make_display_name = [](const std::string& filePath) {
@@ -349,6 +434,18 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
 
     contexts.push_back({std::move(ctx), &targeted[i + 1], std::move(dll_display)});
   }
+
+  // Guest-to-guest export forwarding (see games/halo3's L360.dll/Q10.dll
+  // importing WavesLibDLL.dll by ordinal for the motivating case): tag each
+  // DLL context with its own stable export name and register its export
+  // table into the shared resolver before Analyze runs, so a sibling DLL's
+  // import-by-ordinal resolves to real code. `guestExportStorage`/
+  // `guestExportTables` must outlive both the Analyze and Write loops
+  // below, since the resolver only borrows pointers into them.
+  std::deque<runtime::Export> guestExportStorage;
+  std::vector<std::vector<runtime::Export*>> guestExportTables;
+  RegisterGuestExportTables(contexts, resolver, guestExportStorage, guestExportTables);
+  auto guestModuleDependencies = ComputeGuestModuleDependencies(contexts);
 
   skippedModules_.clear();
   std::vector<std::string> fingerprints(contexts.size());
@@ -502,9 +599,11 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
     }
 
     TemplateRegistry registry;
-    auto registryContent = renderWithJson(registry, "codegen/module_registry_cpp", registryData);
+    auto lang = GetCodegenLanguage();
+    auto templateId = lang == Language::C ? "codegen/module_registry_c" : "codegen/module_registry_cpp";
+    auto registryContent = renderWithJson(registry, templateId, registryData);
 
-    auto registryPath = outputPath / "module_registry.cpp";
+    auto registryPath = outputPath / fmt::format("module_registry.{}", LanguageSourceExt(lang));
     switch (WriteIfChanged(registryPath, registryContent)) {
       case WriteOutcome::Failed:
         return Err<void>(ErrorCategory::IO,
@@ -535,6 +634,11 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
       entry["target_name"] = mod.targetName;
       entry["lib_name"] = manifest_.projectName + "_" + mod.targetName;
       entry["output_dir"] = dllCtx.Config().outDirectoryPath;
+      auto& dependsOn = entry["depends_on"];
+      dependsOn = nlohmann::json::array();
+      for (const auto& dep : guestModuleDependencies[i + 1]) {
+        dependsOn.push_back(manifest_.projectName + "_" + dep);
+      }
       dllTargetsArray.push_back(entry);
     }
 

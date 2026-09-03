@@ -14,6 +14,23 @@
 
 namespace rex::codegen {
 
+namespace {
+
+/**
+ * VectorMaskL/VectorMaskR/VectorShiftTableL/VectorShiftTableR
+ * (include/rex/ppc/intrinsics.h) are brought into unqualified C++ scope by
+ * `using rex::ppc::...;` declarations there. C has no namespaces/using, so
+ * the C backend references x360_-prefixed copies of the same byte tables,
+ * defined inline in the C PCH (pch_h_c.inja).
+ */
+std::string vecTableName(BuilderContext& ctx, std::string_view name) {
+  if (ctx.language() == Language::C)
+    return fmt::format("x360_{}", name);
+  return std::string(name);
+}
+
+}  // namespace
+
 //=============================================================================
 // Load Immediate (not really memory operations, but L* category)
 //=============================================================================
@@ -101,7 +118,8 @@ bool build_lhau(BuilderContext& ctx) {
   // Load Halfword Algebraic with Update: sign-extend then update rA
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.s64 = int16_t(REX_LOAD_U16({}));", ctx.r(ctx.insn.operands[0]), ctx.ea());
+  ctx.println("\t{}.s64 = {};", ctx.r(ctx.insn.operands[0]),
+              numCast(ctx, "int16_t", fmt::format("REX_LOAD_U16({})", ctx.ea())));
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
   return true;
 }
@@ -110,7 +128,8 @@ bool build_lhaux(BuilderContext& ctx) {
   // Load Halfword Algebraic with Update Indexed: EA = rA + rB; rD = EXTS(MEM16(EA)); rA = EA
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.s64 = int16_t(REX_LOAD_U16({}));", ctx.r(ctx.insn.operands[0]), ctx.ea());
+  ctx.println("\t{}.s64 = {};", ctx.r(ctx.insn.operands[0]),
+              numCast(ctx, "int16_t", fmt::format("REX_LOAD_U16({})", ctx.ea())));
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[1]), ctx.ea());
   return true;
 }
@@ -138,7 +157,8 @@ bool build_lwaux(BuilderContext& ctx) {
   // Load Word Algebraic with Update Indexed: EA = rA + rB; rD = EXTS(MEM32(EA)); rA = EA
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.s64 = int32_t(REX_LOAD_U32({}));", ctx.r(ctx.insn.operands[0]), ctx.ea());
+  ctx.println("\t{}.s64 = {};", ctx.r(ctx.insn.operands[0]),
+              numCast(ctx, "int32_t", fmt::format("REX_LOAD_U32({})", ctx.ea())));
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[1]), ctx.ea());
   return true;
 }
@@ -243,7 +263,8 @@ bool build_lfs(BuilderContext& ctx) {
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
   ctx.println("{});", static_cast<int32_t>(ctx.insn.operands[1]));
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = {};", ctx.f(ctx.insn.operands[0]),
+              numCast(ctx, "double", fmt::format("{}.f32", ctx.temp())));
   return true;
 }
 
@@ -253,7 +274,8 @@ bool build_lfsx(BuilderContext& ctx) {
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
   ctx.println("{}.u32);", ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = {};", ctx.f(ctx.insn.operands[0]),
+              numCast(ctx, "double", fmt::format("{}.f32", ctx.temp())));
   return true;
 }
 
@@ -283,7 +305,8 @@ bool build_lfsu(BuilderContext& ctx) {
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u32 = REX_LOAD_U32({});", ctx.temp(), ctx.ea());
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = {};", ctx.f(ctx.insn.operands[0]),
+              numCast(ctx, "double", fmt::format("{}.f32", ctx.temp())));
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
   return true;
 }
@@ -294,7 +317,8 @@ bool build_lfsux(BuilderContext& ctx) {
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}.u32 = REX_LOAD_U32({});", ctx.temp(), ctx.ea());
-  ctx.println("\t{}.f64 = double({}.f32);", ctx.f(ctx.insn.operands[0]), ctx.temp());
+  ctx.println("\t{}.f64 = {};", ctx.f(ctx.insn.operands[0]),
+              numCast(ctx, "double", fmt::format("{}.f32", ctx.temp())));
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[1]), ctx.ea());
   return true;
 }
@@ -486,7 +510,8 @@ bool build_stfiwx(BuilderContext& ctx) {
 
 bool build_stfs(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
+  ctx.println("\t{}.f32 = {};", ctx.temp(),
+              numCast(ctx, "float", fmt::format("{}.f64", ctx.f(ctx.insn.operands[0]))));
   ctx.print("{}", ctx.mmio_check_d_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
   if (ctx.insn.operands[2] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[2]));
@@ -496,7 +521,8 @@ bool build_stfs(BuilderContext& ctx) {
 
 bool build_stfsx(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
+  ctx.println("\t{}.f32 = {};", ctx.temp(),
+              numCast(ctx, "float", fmt::format("{}.f64", ctx.f(ctx.insn.operands[0]))));
   ctx.print("{}", ctx.mmio_check_x_form() ? "\tREX_MM_STORE_U32(" : "\tREX_STORE_U32(");
   if (ctx.insn.operands[1] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[1]));
@@ -519,7 +545,8 @@ bool build_stfsu(BuilderContext& ctx) {
   ctx.emit_set_flush_mode(false);
   ctx.println("\t{} = {} + {}.u32;", ctx.ea(), static_cast<int32_t>(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
-  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
+  ctx.println("\t{}.f32 = {};", ctx.temp(),
+              numCast(ctx, "float", fmt::format("{}.f64", ctx.f(ctx.insn.operands[0]))));
   ctx.println("\tREX_STORE_U32({}, {}.u32);", ctx.ea(), ctx.temp());
   ctx.println("\t{}.u32 = {};", ctx.r(ctx.insn.operands[2]), ctx.ea());
   return true;
@@ -528,7 +555,8 @@ bool build_stfsu(BuilderContext& ctx) {
 bool build_stfsux(BuilderContext& ctx) {
   // Store Floating-point Single with Update Indexed
   ctx.emit_set_flush_mode(false);
-  ctx.println("\t{}.f32 = float({}.f64);", ctx.temp(), ctx.f(ctx.insn.operands[0]));
+  ctx.println("\t{}.f32 = {};", ctx.temp(),
+              numCast(ctx, "float", fmt::format("{}.f64", ctx.f(ctx.insn.operands[0]))));
   ctx.println("\t{} = {}.u32 + {}.u32;", ctx.ea(), ctx.r(ctx.insn.operands[1]),
               ctx.r(ctx.insn.operands[2]));
   ctx.println("\t{}({}, {}.u32);", ctx.mmio_check_x_form() ? "REX_MM_STORE_U32" : "REX_STORE_U32",
@@ -548,8 +576,8 @@ bool build_lvx(BuilderContext& ctx) {
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({})), "
-      "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
-      ctx.v(ctx.insn.operands[0]), ctx.ea());
+      "simde_mm_load_si128((simde__m128i*){})));",
+      ctx.v(ctx.insn.operands[0]), ctx.ea(), vecTableName(ctx, "VectorMaskL"));
   return true;
 }
 
@@ -558,8 +586,8 @@ bool build_lvlx(BuilderContext& ctx) {
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({}.u32 & ~0xF)), "
-      "simde_mm_load_si128((simde__m128i*)&VectorMaskL[({}.u32 & 0xF) * 16])));",
-      ctx.v(ctx.insn.operands[0]), ctx.temp(), ctx.temp());
+      "simde_mm_load_si128((simde__m128i*)&{}[({}.u32 & 0xF) * 16])));",
+      ctx.v(ctx.insn.operands[0]), ctx.temp(), vecTableName(ctx, "VectorMaskL"), ctx.temp());
   return true;
 }
 
@@ -568,9 +596,10 @@ bool build_lvrx(BuilderContext& ctx) {
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*){}.u8, {}.u32 & 0xF ? "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR({}.u32 & ~0xF)), "
-      "simde_mm_load_si128((simde__m128i*)&VectorMaskR[({}.u32 & 0xF) * 16])) : "
+      "simde_mm_load_si128((simde__m128i*)&{}[({}.u32 & 0xF) * 16])) : "
       "simde_mm_setzero_si128());",
-      ctx.v(ctx.insn.operands[0]), ctx.temp(), ctx.temp(), ctx.temp());
+      ctx.v(ctx.insn.operands[0]), ctx.temp(), ctx.temp(), vecTableName(ctx, "VectorMaskR"),
+      ctx.temp());
   return true;
 }
 
@@ -578,8 +607,8 @@ bool build_lvsl(BuilderContext& ctx) {
   emitVectorTempEA(ctx);
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
-      "simde_mm_load_si128((simde__m128i*)&VectorShiftTableL[({}.u32 & 0xF) * 16]));",
-      ctx.v(ctx.insn.operands[0]), ctx.temp());
+      "simde_mm_load_si128((simde__m128i*)&{}[({}.u32 & 0xF) * 16]));",
+      ctx.v(ctx.insn.operands[0]), vecTableName(ctx, "VectorShiftTableL"), ctx.temp());
   return true;
 }
 
@@ -587,8 +616,8 @@ bool build_lvsr(BuilderContext& ctx) {
   emitVectorTempEA(ctx);
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*){}.u8, "
-      "simde_mm_load_si128((simde__m128i*)&VectorShiftTableR[({}.u32 & 0xF) * 16]));",
-      ctx.v(ctx.insn.operands[0]), ctx.temp());
+      "simde_mm_load_si128((simde__m128i*)&{}[({}.u32 & 0xF) * 16]));",
+      ctx.v(ctx.insn.operands[0]), vecTableName(ctx, "VectorShiftTableR"), ctx.temp());
   return true;
 }
 
@@ -648,8 +677,8 @@ bool build_stvx(BuilderContext& ctx) {
   ctx.println(
       "\tsimde_mm_store_si128((simde__m128i*)REX_RAW_ADDR({}), "
       "simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*){}.u8), "
-      "simde_mm_load_si128((simde__m128i*)VectorMaskL)));",
-      ctx.ea(), ctx.v(ctx.insn.operands[0]));
+      "simde_mm_load_si128((simde__m128i*){})));",
+      ctx.ea(), ctx.v(ctx.insn.operands[0]), vecTableName(ctx, "VectorMaskL"));
   return true;
 }
 

@@ -19,6 +19,8 @@
 #include <rex/codegen/config.h>
 #include <rex/codegen/function_graph.h>
 
+#include "../codegen_language.h"
+
 struct ppc_insn;
 
 namespace rex::codegen {
@@ -103,6 +105,42 @@ struct BuilderContext {
 
   /// Get the function graph (single source of truth for function info)
   const FunctionGraph& graph() const;
+
+  //=========================================================================
+  // Language-Conditional Emission Helpers
+  //
+  // Single decision point for the handful of spots where emitted text must
+  // differ between the C++ and C11 backends (rex::codegen::GetCodegenLanguage()).
+  // Everything else (macro/function names invoked from generated code, SIMDe
+  // intrinsics, etc.) stays textually identical between languages; only the
+  // PCH's definitions of those macros/functions differ per language.
+  //=========================================================================
+
+  /// "ctx." in C++ mode (ctx is a reference), "ctx->" in C mode (ctx is a
+  /// pointer). Used by every register accessor below.
+  const char* ctxPrefix() const;
+
+  /// The whole-context expression: "ctx" in C++ mode, "*ctx" in C mode. Used
+  /// where the full PPCContext is copied (setjmp/longjmp env save/restore).
+  const char* wholeCtx() const;
+
+  /// A cast-to-`type` prefix meant to be followed by a parenthesized
+  /// expression: "static_cast<type>" in C++ mode (byte-identical to the
+  /// existing output), "(type)" in C mode.
+  std::string cast(std::string_view type) const;
+
+  /// "std::" in C++ mode, "" in C mode. For qualifying free functions that
+  /// exist in both <cstdlib>-style C++ headers and their C11 equivalent.
+  const char* cppNs() const;
+
+  /// "auto" in C++ mode, "__auto_type" in C mode (GNU C extension, valid
+  /// under -std=gnu11, the C backend's target dialect).
+  const char* autoKw() const;
+
+  /// The codegen output language for this run. Prefer the helpers above for
+  /// emitting text; use this directly only when a call site needs a full
+  /// alternate statement rather than a substitutable fragment.
+  Language language() const { return GetCodegenLanguage(); }
 
   //=========================================================================
   // Register Accessors

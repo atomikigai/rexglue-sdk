@@ -414,6 +414,45 @@ void detectSaveRestoreHelpers(const BinaryView& binary, AnalysisState& state) {
 }
 
 //=============================================================================
+// Export Forwarding: this binary's own XEX exports, for guest-to-guest
+// imports from sibling [[modules]] DLLs (e.g. L360.dll/Q10.dll importing
+// WavesLibDLL.dll by ordinal - a guest-DLL-to-guest-DLL import the import
+// resolution above cannot see, since ExportResolver only carried static
+// kernel tables before ProjectRecompiler::Run() started also registering
+// each [[modules]] DLL's own export table there).
+//=============================================================================
+
+// Records one forwarding thunk per exported ordinal and makes sure its
+// target guest address is queued for discovery, even if nothing inside this
+// binary itself ever calls it (export-only entry points reached solely via
+// another module's import table).
+void registerExportThunks(CodegenContext& ctx) {
+  if (ctx.exportModuleName().empty()) {
+    return;  // Not a DLL module, or has no known stable export name.
+  }
+
+  auto exportSymbols = ctx.binary().exportSymbols();
+  if (exportSymbols.empty()) {
+    return;
+  }
+
+  auto& graph = ctx.graph;
+  for (const auto& exp : exportSymbols) {
+    if (graph.getFunction(exp.address) == nullptr && !graph.isImport(exp.address)) {
+      graph.addFunction(exp.address, 0, FunctionAuthority::DISCOVERED, true);
+    }
+    ctx.exportThunks.push_back(ExportThunkInfo{
+        .ordinal = exp.ordinal,
+        .thunkName = fmt::format("{}_ord_{}", ctx.exportModuleName(), exp.ordinal),
+        .targetAddress = exp.address,
+    });
+  }
+
+  REXCODEGEN_TRACE("Analyze: registered {} export forwarding thunk(s) for '{}'",
+                   ctx.exportThunks.size(), ctx.exportModuleName());
+}
+
+//=============================================================================
 // Register Phase: imports, helpers, PDATA, config functions
 //=============================================================================
 
@@ -690,6 +729,8 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
   if (ehFuncsQueued > 0) {
     REXCODEGEN_TRACE("Analyze: queued {} functions from exception handling", ehFuncsQueued);
   }
+
+  registerExportThunks(ctx);
 
   return Ok();
 }

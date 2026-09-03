@@ -33,3 +33,14 @@ if(EXISTS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ mod.output_dir }}/sour
     rexglue_configure_module_target({{ mod.lib_name }} HOST {{ cmake_var("REXGLUE_HOST_TARGET") }})
 endif()
 {% endfor %}
+
+# Guest-to-guest export forwarding: link each DLL module against the sibling
+# [[modules]] DLL(s) it imports from by ordinal (see
+# rexglue-sdk/src/codegen/phase_register.cpp registerExportThunks() and
+# export_thunks_cpp.inja/export_thunks_c.inja). A separate loop, after every
+# add_library() above has run, so this does not depend on manifest
+# declaration order between a consumer and its provider.
+{% for mod in dll_modules %}{% for dep in mod.depends_on %}if(TARGET {{ mod.lib_name }} AND TARGET {{ dep }})
+    target_link_libraries({{ mod.lib_name }} PRIVATE {{ dep }})
+endif()
+{% endfor %}{% endfor %}

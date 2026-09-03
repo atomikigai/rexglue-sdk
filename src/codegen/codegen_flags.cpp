@@ -86,4 +86,13 @@ REXCVAR_DEFINE_UINT32(max_blocks_per_function, 10000, "Codegen",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly)
     .range(1, 1000000);
 
+//=============================================================================
+// Codegen/Output language
+//=============================================================================
+
+REXCVAR_DEFINE_STRING(codegen_language, "cpp", "Codegen",
+                      "Output language for generated recompiler code: 'cpp' (default) or 'c'")
+    .allowed({"cpp", "c"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 // clang-format on

@@ -12,13 +12,21 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <charconv>
 #include <cstring>
+#include <mutex>
+#include <random>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -43,6 +51,20 @@
 #include <netinet/ip.h>
 #include <sys/socket.h>
 #endif
+
+// System Link config, see docs/x360/04-multijugador-local.md section 2.
+REXCVAR_DEFINE_STRING(
+    net_peers, "", "Kernel",
+    "Comma-separated ip:port list of System Link peers a broadcast sendto (255.255.255.255) is "
+    "replicated to; needed because a real UDP broadcast usually does not reach another socket "
+    "bound on the same host.");
+REXCVAR_DEFINE_UINT32(
+    net_port_offset, 0, "Kernel",
+    "Added to every NetDll_bind() port, so two instances on one host do not collide.");
+REXCVAR_DEFINE_BOOL(
+    net_direct_ip, false, "Kernel",
+    "XNetXnAddrToInAddr returns the real LAN IP verbatim instead of a synthetic 10.x.y.z secure "
+    "address per (XNADDR, XNKID) pair.");
 
 namespace rex {
 namespace kernel {
@@ -94,6 +116,137 @@ typedef struct {
   rex::be<uint32_t> count_pending;
   XNQOSINFO info[1];
 } XNQOS;
+
+// System Link session key pair (NetDll_XNetCreateKey/RegisterKey/
+// UnregisterKey). No cryptographic guarantees: this is a trusted-LAN
+// module, same simplification as apps/x360/x360recomp's runtime/src/net
+// module (docs/x360/04-multijugador-local.md section 2).
+struct XNKID {
+  uint8_t ab[8];
+};
+
+struct XNKEY {
+  uint8_t ab[16];
+};
+
+// -----------------------------------------------------------------------
+// System Link module state: key registration table, secure<->real address
+// table, and the XNetConnect "reachable" set. See
+// docs/x360/04-multijugador-local.md section 2 for the design this mirrors
+// (also implemented, independently, by x360recomp's C runtime for the
+// standalone recompiler product).
+// -----------------------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t kXNetKeyTableCap = 16;
+constexpr uint32_t kXNetAddrTableCap = 32;
+constexpr uint8_t kXNetXnkidSystemLinkBit = 0x01;
+constexpr uint32_t kXNetConnectStatusNotConnected = 0;
+constexpr uint32_t kXNetConnectStatusConnected = 2;
+
+struct XNetKeyEntry {
+  bool used = false;
+  XNKID kid{};
+  XNKEY key{};
+};
+
+struct XNetAddrEntry {
+  bool used = false;
+  XNADDR xnaddr{};
+  XNKID kid{};
+  uint32_t secure_ip_host_order = 0;
+};
+
+struct XNetConnectEntry {
+  bool used = false;
+  uint32_t ip_host_order = 0;
+};
+
+std::mutex g_xnet_lock;
+XNetKeyEntry g_xnet_keys[kXNetKeyTableCap];
+XNetAddrEntry g_xnet_addrs[kXNetAddrTableCap];
+XNetConnectEntry g_xnet_connects[kXNetAddrTableCap];
+uint32_t g_xnet_next_synth_low24 = 0;
+uint16_t g_xnet_system_link_port = 0;
+
+bool XnkidEqual(const XNKID& a, const XNKID& b) {
+  return std::memcmp(a.ab, b.ab, sizeof(a.ab)) == 0;
+}
+
+bool XnAddrEqual(const XNADDR& a, const XNADDR& b) {
+  return a.ina.s_addr == b.ina.s_addr && std::memcmp(a.abEnet, b.abEnet, sizeof(a.abEnet)) == 0;
+}
+
+void FillRandomBytes(uint8_t* buf, size_t len) {
+  // Not cryptographically strong: this module's whole security model is
+  // "LAN you already trust" (docs/x360/04-multijugador-local.md section 2),
+  // same as the C runtime's x360_net_fill_random. A distinct RNG from
+  // NetDll_XNetRandom_entry (which is deliberately constant-filled above
+  // for replay-friendly determinism) since keys need to actually vary.
+  static std::mt19937 rng{std::random_device{}()};
+  std::uniform_int_distribution<int> dist(0, 255);
+  for (size_t i = 0; i < len; i++) {
+    buf[i] = static_cast<uint8_t>(dist(rng));
+  }
+}
+
+uint32_t NextSyntheticIp() {
+  g_xnet_next_synth_low24 = (g_xnet_next_synth_low24 + 1) & 0x00FFFFFFu;
+  if (g_xnet_next_synth_low24 == 0) {
+    g_xnet_next_synth_low24 = 1;
+  }
+  return 0x0A000000u | g_xnet_next_synth_low24;  // 10.x.y.z, host order.
+}
+
+// Splits a "host:port,host:port,..." cvar value. Malformed tokens are
+// skipped rather than aborting the whole list.
+std::vector<std::pair<std::string, uint16_t>> ParseNetPeers(std::string_view spec) {
+  std::vector<std::pair<std::string, uint16_t>> peers;
+  size_t pos = 0;
+  while (pos <= spec.size()) {
+    size_t comma = spec.find(',', pos);
+    std::string_view token =
+        spec.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+    size_t colon = token.rfind(':');
+    if (colon != std::string_view::npos && colon > 0 && colon + 1 < token.size()) {
+      std::string_view host = token.substr(0, colon);
+      std::string_view port_str = token.substr(colon + 1);
+      int port = 0;
+      auto result = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
+      if (result.ec == std::errc() && port > 0 && port <= 0xFFFF) {
+        peers.emplace_back(std::string(host), static_cast<uint16_t>(port));
+      }
+    }
+    if (comma == std::string_view::npos) {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return peers;
+}
+
+// Best-effort fan-out of a broadcast sendto (destination 255.255.255.255)
+// to every configured peer: most host network stacks do not deliver a real
+// UDP broadcast to another socket bound on the same host, so running two
+// instances on one machine needs an explicit peer list (net_peers doc
+// comment above; docs/x360/04-multijugador-local.md section 2).
+void SendBroadcastToPeers(XSocket* socket, mapped_void buf_ptr, uint32_t buf_len, uint32_t flags) {
+  std::string peers_spec = REXCVAR_GET(net_peers);
+  if (peers_spec.empty()) {
+    return;
+  }
+
+  for (const auto& [host, port] : ParseNetPeers(peers_spec)) {
+    N_XSOCKADDR_IN dest{};
+    dest.sin_family = XSocket::X_AF_INET;
+    dest.sin_port = port;
+    dest.sin_addr = static_cast<uint32_t>(ntohl(inet_addr(host.c_str())));
+    socket->SendTo(buf_ptr, buf_len, flags, &dest, sizeof(sockaddr_in));
+  }
+}
+
+}  // namespace
 
 struct Xsockaddr_t {
   rex::be<uint16_t> sa_family;
@@ -183,6 +336,7 @@ struct XNetStartupParams {
 XNetStartupParams xnet_startup_params = {};
 
 u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
+  REXLOG_INFO("System Link trace: XNetStartup");
   if (params) {
     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
@@ -210,6 +364,12 @@ u32 NetDll_XNetCleanup_entry(u32 caller, mapped_void params) {
   // TODO: Shut down and delete.
   // delete xnet;
 
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  std::memset(g_xnet_keys, 0, sizeof(g_xnet_keys));
+  std::memset(g_xnet_addrs, 0, sizeof(g_xnet_addrs));
+  std::memset(g_xnet_connects, 0, sizeof(g_xnet_connects));
+  g_xnet_next_synth_low24 = 0;
+  g_xnet_system_link_port = 0;
   return 0;
 }
 
@@ -478,22 +638,197 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
-u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
-                                    mapped_void in_addr) {
-  return 1;
+//
+// Looks up (or allocates, per `net_direct_ip`) the secure IN_ADDR for the
+// (xnaddr, xnkid) pair: the real LAN IP when net_direct_ip is set, else a
+// synthetic 10.x.y.z, same trusted-LAN simplification the C runtime's
+// x360_net_xnaddr_to_inaddr uses (docs/x360/04-multijugador-local.md
+// section 2, "Direcciones").
+u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, ppc_ptr_t<XNKID> xid,
+                                    ppc_ptr_t<in_addr> in_addr_out) {
+  if (!xn_addr || !xid || !in_addr_out) {
+    return 1;
+  }
+
+  XNKID kid = *xid;
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  int free_slot = -1;
+  for (uint32_t i = 0; i < kXNetAddrTableCap; i++) {
+    if (g_xnet_addrs[i].used && XnAddrEqual(g_xnet_addrs[i].xnaddr, *xn_addr) &&
+        XnkidEqual(g_xnet_addrs[i].kid, kid)) {
+      in_addr_out->s_addr = htonl(g_xnet_addrs[i].secure_ip_host_order);
+      return 0;
+    }
+    if (!g_xnet_addrs[i].used && free_slot < 0) {
+      free_slot = static_cast<int>(i);
+    }
+  }
+  if (free_slot < 0) {
+    return 1;
+  }
+
+  uint32_t secure_ip = REXCVAR_GET(net_direct_ip) ? ntohl(xn_addr->ina.s_addr) : NextSyntheticIp();
+  g_xnet_addrs[free_slot].used = true;
+  g_xnet_addrs[free_slot].xnaddr = *xn_addr;
+  g_xnet_addrs[free_slot].kid = kid;
+  g_xnet_addrs[free_slot].secure_ip_host_order = secure_ip;
+  in_addr_out->s_addr = htonl(secure_ip);
+  return 0;
 }
 
-// Does the reverse of the above.
-// FIXME: Arguments may not be correct.
-u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
-                                    mapped_void xid) {
+// Does the reverse of the above: resolves a previously-issued secure
+// IN_ADDR back to the (XNADDR, XNKID) pair that produced it.
+// `in_addr_value` is passed by value (a raw IN_ADDR, i.e. network-order
+// bytes), matching the real XNetInAddrToXnAddr(IN_ADDR, XNADDR*, XNKID*)
+// signature -- the previous stub's pointer-typed first argument was marked
+// FIXME because it did not match this by-value calling convention.
+u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, u32 in_addr_value, ppc_ptr_t<XNADDR> xn_addr,
+                                    ppc_ptr_t<XNKID> xid) {
+  uint32_t secure_ip = ntohl(in_addr_value);
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  for (uint32_t i = 0; i < kXNetAddrTableCap; i++) {
+    if (g_xnet_addrs[i].used && g_xnet_addrs[i].secure_ip_host_order == secure_ip) {
+      if (xn_addr) {
+        *xn_addr = g_xnet_addrs[i].xnaddr;
+      }
+      if (xid) {
+        *xid = g_xnet_addrs[i].kid;
+      }
+      return 0;
+    }
+  }
   return 1;
 }
 
 // https://www.google.com/patents/WO2008112448A1?cl=en
 // Reserves a port for use by system link
 u32 NetDll_XNetSetSystemLinkPort_entry(u32 caller, u32 port) {
+  if (port > 0xFFFF) {
+    return 1;
+  }
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  g_xnet_system_link_port = static_cast<uint16_t>(port);
+  return 0;
+}
+
+u32 NetDll_XNetGetSystemLinkPort_entry(u32 caller) {
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  return g_xnet_system_link_port;
+}
+
+// Generates a fresh System Link XNKID (byte 0 carries
+// kXNetXnkidSystemLinkBit, matching the C runtime's
+// x360_net_create_key/X360_NET_XNKID_SYSTEM_LINK_BIT) and a random XNKEY.
+// Does not register it -- mirrors real XNetCreateKey, which is a pure
+// generator.
+u32 NetDll_XNetCreateKey_entry(u32 caller, ppc_ptr_t<XNKID> session_id, ppc_ptr_t<XNKEY> key) {
+  REXLOG_INFO("System Link trace: XNetCreateKey");
+  if (!session_id || !key) {
+    return 1;
+  }
+
+  XNKID kid{};
+  XNKEY xkey{};
+  FillRandomBytes(kid.ab, sizeof(kid.ab));
+  kid.ab[0] |= kXNetXnkidSystemLinkBit;
+  FillRandomBytes(xkey.ab, sizeof(xkey.ab));
+
+  *session_id = kid;
+  *key = xkey;
+  return 0;
+}
+
+// Inserts/updates `session_id -> key` in the registration table (capacity
+// kXNetKeyTableCap, matching XNetStartupParams' cfgKeyRegMax default on
+// real hardware).
+u32 NetDll_XNetRegisterKey_entry(u32 caller, ppc_ptr_t<XNKID> session_id, ppc_ptr_t<XNKEY> key) {
+  REXLOG_INFO("System Link trace: XNetRegisterKey");
+  if (!session_id || !key) {
+    return 1;
+  }
+
+  XNKID kid = *session_id;
+  XNKEY xkey = *key;
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  int free_slot = -1;
+  for (uint32_t i = 0; i < kXNetKeyTableCap; i++) {
+    if (g_xnet_keys[i].used && XnkidEqual(g_xnet_keys[i].kid, kid)) {
+      free_slot = static_cast<int>(i);
+      break;
+    }
+    if (!g_xnet_keys[i].used && free_slot < 0) {
+      free_slot = static_cast<int>(i);
+    }
+  }
+  if (free_slot < 0) {
+    return 1;
+  }
+
+  g_xnet_keys[free_slot].used = true;
+  g_xnet_keys[free_slot].kid = kid;
+  g_xnet_keys[free_slot].key = xkey;
+  return 0;
+}
+
+// Removes `session_id` from the registration table.
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, ppc_ptr_t<XNKID> session_id) {
+  if (!session_id) {
+    return 1;
+  }
+
+  XNKID kid = *session_id;
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  for (uint32_t i = 0; i < kXNetKeyTableCap; i++) {
+    if (g_xnet_keys[i].used && XnkidEqual(g_xnet_keys[i].kid, kid)) {
+      g_xnet_keys[i].used = false;
+      return 0;
+    }
+  }
   return 1;
+}
+
+// No real handshake on a trusted LAN: registers `in_addr_value` as
+// reachable and always succeeds, matching x360_net_connect.
+u32 NetDll_XNetConnect_entry(u32 caller, u32 in_addr_value) {
+  REXLOG_INFO("System Link trace: XNetConnect");
+  uint32_t ip_host_order = ntohl(in_addr_value);
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  int free_slot = -1;
+  for (uint32_t i = 0; i < kXNetAddrTableCap; i++) {
+    if (g_xnet_connects[i].used && g_xnet_connects[i].ip_host_order == ip_host_order) {
+      return 0;
+    }
+    if (!g_xnet_connects[i].used && free_slot < 0) {
+      free_slot = static_cast<int>(i);
+    }
+  }
+  if (free_slot < 0) {
+    return 1;
+  }
+  g_xnet_connects[free_slot].used = true;
+  g_xnet_connects[free_slot].ip_host_order = ip_host_order;
+  return 0;
+}
+
+// Reports CONNECTED for any address previously passed to XNetConnect, else
+// NOT_CONNECTED -- matches x360_net_get_connect_status (no PENDING/LOST
+// states on this trusted-LAN module).
+u32 NetDll_XNetGetConnectStatus_entry(u32 caller, u32 in_addr_value) {
+  uint32_t ip_host_order = ntohl(in_addr_value);
+
+  std::lock_guard<std::mutex> lock(g_xnet_lock);
+  for (uint32_t i = 0; i < kXNetAddrTableCap; i++) {
+    if (g_xnet_connects[i].used && g_xnet_connects[i].ip_host_order == ip_host_order) {
+      return kXNetConnectStatusConnected;
+    }
+  }
+  return kXNetConnectStatusNotConnected;
 }
 
 // https://github.com/ILOVEPIE/Cxbx-Reloaded/blob/master/src/CxbxKrnl/EmuXOnline.h#L39
@@ -560,6 +895,61 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
   return X_ERROR_FUNCTION_FAILED;
+}
+
+// No real QoS probe exchange (trusted LAN, same as NetDll_XNetQosServiceLookup
+// above and x360_net_qos_build_synthetic): answers immediately with one
+// synthetic XNQOSINFO entry per remote console/gateway, each reporting 1ms
+// RTT and a high bandwidth estimate. `caller` through `service_ids_array`
+// mirror the real 13-argument signature (5 of which arrive on the guest
+// stack) but are otherwise unused: this module does not need per-target
+// results to unblock a title's join flow.
+u32 NetDll_XNetQosLookup_entry(u32 caller, u32 num_remote_consoles,
+                               mapped_void remote_addresses_array_ptrs,
+                               mapped_void session_id_array_ptrs,
+                               mapped_void remote_keys_array_ptrs, u32 num_gateways,
+                               mapped_void gateways_array, mapped_void service_ids_array,
+                               u32 probes_count, u32 bits_per_second, u32 flags, u32 event_handle,
+                               mapped_u32 qos_ptr) {
+  REXLOG_INFO("System Link trace: XNetQosLookup");
+  if (!qos_ptr) {
+    return 0x271D;  // WSAEACCES
+  }
+
+  uint32_t entry_count = num_remote_consoles + num_gateways;
+  if (entry_count == 0) {
+    entry_count = 1;
+  }
+
+  uint32_t alloc_size = static_cast<uint32_t>(sizeof(XNQOS)) +
+                        static_cast<uint32_t>(sizeof(XNQOSINFO)) * (entry_count - 1);
+  auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(alloc_size);
+  auto qos = REX_KERNEL_MEMORY()->TranslateVirtual<XNQOS*>(qos_guest);
+  qos->count = entry_count;
+  qos->count_pending = 0;
+  for (uint32_t i = 0; i < entry_count; i++) {
+    auto& info = qos->info[i];
+    info.flags = 0x01 /* complete */ | 0x02 /* target contacted */;
+    info.reserved = 0;
+    info.probes_xmit = 1;
+    info.probes_recv = 1;
+    info.data_len = 0;
+    info.data_ptr = 0;
+    info.rtt_min_in_msecs = 1;
+    info.rtt_med_in_msecs = 1;
+    info.up_bits_per_sec = 100000000;
+    info.down_bits_per_sec = 100000000;
+  }
+  *qos_ptr = qos_guest;
+
+  if (event_handle) {
+    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
+    if (ev) {
+      ev->Set(0, false);
+    }
+  }
+
+  return 0;
 }
 
 u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
@@ -643,6 +1033,56 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
   return XSUCCEEDED(status) ? 0 : -1;
 }
 
+u32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                            mapped_void optval_ptr, mapped_u32 optlen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  uint32_t optlen = optlen_ptr ? optlen_ptr.value() : 0;
+  X_STATUS status = socket->GetOption(level, optname, optval_ptr, &optlen);
+  if (XFAILED(status)) {
+    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    return -1;
+  }
+  if (optlen_ptr) {
+    *optlen_ptr = optlen;
+  }
+  return 0;
+}
+
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 namelen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    return -1;
+  }
+
+  N_XSOCKADDR_IN native_name;
+  X_STATUS status = socket->GetSockName(&native_name);
+  if (XFAILED(status)) {
+    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    return -1;
+  }
+
+  if (name) {
+    name->sin_family = native_name.sin_family;
+    name->sin_port = native_name.sin_port;
+    name->sin_addr = native_name.sin_addr;
+    std::memset(name->x_sin_zero, 0, sizeof(name->x_sin_zero));
+  }
+  if (namelen_ptr) {
+    *namelen_ptr = sizeof(XSOCKADDR_IN);
+  }
+
+  return 0;
+}
+
 u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
   auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
   if (!socket) {
@@ -670,6 +1110,14 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   }
 
   N_XSOCKADDR_IN native_name(name);
+  // net_port_offset: shift an explicit bind port so two instances on one
+  // host do not collide (docs/x360/04-multijugador-local.md section 2,
+  // "Dos instancias en una máquina"). Port 0 (let the OS pick an ephemeral
+  // port) is left untouched, and the default offset of 0 is a no-op.
+  uint32_t port_offset = REXCVAR_GET(net_port_offset);
+  if (port_offset != 0 && native_name.sin_port != 0) {
+    native_name.sin_port = static_cast<uint16_t>(uint32_t(native_name.sin_port) + port_offset);
+  }
   X_STATUS status = socket->Bind(&native_name, namelen);
   if (XFAILED(status)) {
     XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
@@ -916,7 +1364,15 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   }
 
   N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+
+  // 0xFFFFFFFF (255.255.255.255) is the same bit pattern in network and
+  // host order, so no ntohl() is needed to recognize it.
+  if (to_ptr && native_to.sin_addr == 0xFFFFFFFFu) {
+    SendBroadcastToPeers(socket.get(), buf_ptr, buf_len, flags);
+  }
+
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -961,6 +1417,8 @@ REX_EXPORT(__imp__NetDll_XNetXnAddrToInAddr, rex::kernel::xam::NetDll_XNetXnAddr
 REX_EXPORT(__imp__NetDll_XNetInAddrToXnAddr, rex::kernel::xam::NetDll_XNetInAddrToXnAddr_entry)
 REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
+REX_EXPORT(__imp__NetDll_XNetGetSystemLinkPort,
+           rex::kernel::xam::NetDll_XNetGetSystemLinkPort_entry)
 REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
 REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
@@ -973,6 +1431,8 @@ REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
 REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
 REX_EXPORT(__imp__NetDll_shutdown, rex::kernel::xam::NetDll_shutdown_entry)
 REX_EXPORT(__imp__NetDll_setsockopt, rex::kernel::xam::NetDll_setsockopt_entry)
+REX_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
 REX_EXPORT(__imp__NetDll_ioctlsocket, rex::kernel::xam::NetDll_ioctlsocket_entry)
 REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
@@ -1030,25 +1490,25 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpSetStatusCallback);
 REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
-REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+REX_EXPORT(__imp__NetDll_XNetConnect, rex::kernel::xam::NetDll_XNetConnect_entry)
+REX_EXPORT(__imp__NetDll_XNetCreateKey, rex::kernel::xam::NetDll_XNetCreateKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
+REX_EXPORT(__imp__NetDll_XNetGetConnectStatus,
+           rex::kernel::xam::NetDll_XNetGetConnectStatus_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
+REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
 REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
@@ -1098,5 +1558,3 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
 REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
-REX_EXPORT_STUB(__imp__NetDll_getsockopt);

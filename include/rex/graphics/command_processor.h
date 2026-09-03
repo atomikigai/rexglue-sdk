@@ -18,9 +18,11 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include <rex/graphics/gpu_host.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/xenos.h>
@@ -81,6 +83,11 @@ class CommandProcessor {
     kFxaaExtreme,
   };
 
+  // `kernel_state` is accepted for backend subclasses that still pass it
+  // through from GraphicsSystem::kernel_state() (unused when that is null,
+  // e.g. GraphicsSystem set up via SetupGuestGpu(IGpuHost*)); guest-address
+  // translation and worker-thread creation always go through
+  // graphics_system->gpu_host() instead.
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
   virtual ~CommandProcessor();
 
@@ -94,6 +101,8 @@ class CommandProcessor {
   virtual void Shutdown();
 
   void CallInThread(std::function<void()> fn);
+  // Thread-safe emptiness check for pending_fns_ (see its own comment).
+  bool HasPendingFns();
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -230,14 +239,30 @@ class CommandProcessor {
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
 
+  // Real (SDK-backed) or fallback (host-only) rex::memory::Memory obtained
+  // from graphics_system->memory(): used by backend subclasses to construct
+  // SharedMemory/PrimitiveProcessor/TextureCache, which need a real Memory
+  // instance for host-GPU bookkeeping. NOT used for guest ring buffer or
+  // register I/O -- see the TranslatePhysical calls below, which go through
+  // graphics_system_->gpu_host() instead (see gpu_host.h for why).
   memory::Memory* memory_ = nullptr;
-  system::KernelState* kernel_state_ = nullptr;
+  system::KernelState* kernel_state_ = nullptr;  // See constructor comment.
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* register_file_ = nullptr;
 
   std::atomic<bool> worker_running_;
-  system::object_ref<system::XHostThread> worker_thread_;
+  std::unique_ptr<system::IGpuHostThread> worker_thread_;
+  // Set from WorkerThreadMain itself at startup; lets CallInThread detect
+  // "already on the worker thread" without depending on IGpuHostThread
+  // exposing a thread identity (std::this_thread::get_id works the same for
+  // any thread regardless of how the host created it).
+  std::thread::id worker_thread_id_;
 
+  // Guards pending_fns_: CallInThread's queueing path is called from
+  // arbitrary guest/host threads (kernel export handlers, UI thread), while
+  // WorkerThreadMain drains it from the worker thread alone -- std::queue
+  // has no internal synchronization of its own.
+  std::mutex pending_fns_mutex_;
   std::queue<std::function<void()>> pending_fns_;
 
   // MicroEngine binary from PM4_ME_INIT

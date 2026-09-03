@@ -13,6 +13,8 @@
 
 #include <filesystem>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -74,6 +76,42 @@ struct AnalysisState {
 };
 
 /**
+ * Sanitizes `name` into a valid C/C++ identifier fragment: any character
+ * outside [A-Za-z0-9_] becomes '_', and a leading digit gets a '_' prefix.
+ * Used for guest-to-guest export forwarding thunk names (see
+ * ExportThunkInfo), since a manifest target name like "WaveShell-Xbox"
+ * (derived from a DLL's file name, which may contain '-' or other
+ * punctuation) is not itself a valid symbol name.
+ */
+inline std::string ToIdentifier(std::string_view name) {
+  std::string result;
+  result.reserve(name.size() + 1);
+  for (char c : name) {
+    bool isValid = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                   c == '_';
+    result += isValid ? c : '_';
+  }
+  if (!result.empty() && result[0] >= '0' && result[0] <= '9') {
+    result.insert(result.begin(), '_');
+  }
+  return result;
+}
+
+/**
+ * One guest-to-guest export forwarding thunk: this binary exports `ordinal`
+ * at guest address `targetAddress`, and a sibling [[modules]] DLL that
+ * imports this ordinal should be able to call it via a stable symbol name
+ * (`thunkName`, formatted as "<exportModuleName>_ord_<ordinal>"). Populated
+ * by phase_register.cpp's Register phase, consumed by CodegenWriter::write()
+ * to emit resources/templates/codegen/export_thunks_{cpp,c}.inja.
+ */
+struct ExportThunkInfo {
+  uint16_t ordinal = 0;
+  std::string thunkName;
+  uint32_t targetAddress = 0;
+};
+
+/**
  * Unified context for the entire codegen pipeline.
  *
  * This class owns all the core data structures used throughout analysis
@@ -124,6 +162,11 @@ class CodegenContext {
   FunctionGraph graph;    ///< All functions (including imports)
   AnalysisErrors errors;  ///< Accumulated errors
 
+  /// Guest-to-guest export forwarding thunks for this binary's own exports
+  /// (see ExportThunkInfo). Empty unless this binary has an export table
+  /// (exportModuleName() also set, see setExportModuleName()).
+  std::vector<ExportThunkInfo> exportThunks;
+
   /// Scan phase artifacts (passed to Discover for scanner setup)
   struct {
     std::vector<CodeRegion> codeRegions;  ///< Null-delimited code regions
@@ -163,6 +206,12 @@ class CodegenContext {
   void setHasDllModules(bool has) { has_dll_modules_ = has; }
   bool hasDllModules() const { return has_dll_modules_; }
 
+  /// Stable name this binary's own exports are forwarded under (its manifest
+  /// target name, e.g. "WavesLibDLL"). Empty for binaries with no export
+  /// table entry (see ProjectRecompiler::Run()).
+  void setExportModuleName(std::string name) { exportModuleName_ = std::move(name); }
+  const std::string& exportModuleName() const { return exportModuleName_; }
+
  private:
   CodegenContext() = default;
 
@@ -174,6 +223,7 @@ class CodegenContext {
   std::filesystem::path configDir_;  ///< Directory containing config file (for relative paths)
   bool is_dll_module_ = false;       ///< True if this module is a DLL (shared library output)
   bool has_dll_modules_ = false;     ///< True if the project has DLL modules (multi-binary)
+  std::string exportModuleName_;     ///< See setExportModuleName()
 };
 
 }  // namespace rex::codegen

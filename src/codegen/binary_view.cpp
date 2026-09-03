@@ -14,10 +14,75 @@
 #include <rex/logging.h>
 
 #include "codegen_logging.h"
+#include <rex/memory/utils.h>
 #include <rex/system/binary_types.h>
 #include <rex/system/module.h>
 
+using rex::memory::load_and_swap;
+
 namespace rex::codegen {
+
+namespace {
+
+// xex2_export_table layout (see rex/system/util/xex2_info.h and
+// XexModule::GetProcAddress(ordinal), which parses the same structure from
+// live guest memory): magic[3], modulenumber[2], version[3], imagebaseaddr,
+// count, base, then `count` ordOffset words. All fields are big-endian.
+constexpr uint32_t kExportTableHeaderSize = 0x2C;
+
+// Parses this binary's own XEX2 export table (ordinal -> guest address) from
+// already-copied section data. Self-contained: no live guest memory access,
+// so it works the same way at codegen analysis time as it does for a loaded
+// runtime::Module. Returns an empty vector if there is no export table, or
+// it fails to fit within its containing section.
+std::vector<ExportSymbol> parseExportTable(uint32_t exportTableAddr,
+                                            std::span<const SectionView> sections) {
+  std::vector<ExportSymbol> result;
+  if (exportTableAddr == 0) {
+    return result;
+  }
+
+  const SectionView* section = nullptr;
+  for (const auto& candidate : sections) {
+    if (candidate.contains(exportTableAddr)) {
+      section = &candidate;
+      break;
+    }
+  }
+  if (!section) {
+    return result;
+  }
+
+  uint32_t offset = exportTableAddr - section->baseAddress;
+  if (offset + kExportTableHeaderSize > section->size) {
+    return result;
+  }
+  const uint8_t* header = section->data + offset;
+
+  uint32_t imagebaseaddr = load_and_swap<uint32_t>(header + 0x20);
+  uint32_t count = load_and_swap<uint32_t>(header + 0x24);
+  uint32_t base = load_and_swap<uint32_t>(header + 0x28);
+
+  // Reject implausible counts rather than reading past the section: a
+  // corrupt/foreign table should degrade to "no exports", not a crash.
+  if (count == 0 || count > 65535 ||
+      offset + kExportTableHeaderSize + static_cast<uint64_t>(count) * 4 > section->size) {
+    return result;
+  }
+
+  result.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t ordOffset = load_and_swap<uint32_t>(header + kExportTableHeaderSize + i * 4);
+    if (ordOffset == 0) {
+      continue;  // Unused ordinal slot
+    }
+    uint32_t address = ordOffset + (imagebaseaddr << 16);
+    result.push_back(ExportSymbol{.ordinal = static_cast<uint16_t>(base + i), .address = address});
+  }
+  return result;
+}
+
+}  // namespace
 
 BinaryView BinaryView::fromModule(const runtime::Module& module) {
   BinaryView view;
@@ -100,6 +165,12 @@ BinaryView BinaryView::fromModule(const runtime::Module& module) {
 
   REXCODEGEN_DEBUG("BinaryView: loaded {} sections, base=0x{:08X}, size=0x{:X}",
                    view.sections_.size(), view.baseAddress_, view.imageSize_);
+
+  view.exportSymbols_ = parseExportTable(view.exportTableAddr_, view.sections_);
+  if (!view.exportSymbols_.empty()) {
+    REXCODEGEN_DEBUG("BinaryView: parsed {} export(s) from table at 0x{:08X}",
+                     view.exportSymbols_.size(), view.exportTableAddr_);
+  }
 
   return view;
 }

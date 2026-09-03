@@ -1,0 +1,37 @@
+//=============================================================================
+// ReXGlue Generated - {{ project }} Function Registration (C11 variant)
+//=============================================================================
+
+#include "{{ project }}_init.h"
+
+// C-ABI registrar hook. The C++ pipeline calls
+// rex::runtime::IModuleRegistrar::SetFunction once per function through a
+// vtable; the C backend instead reuses x360_ppc_install_mappings
+// (x360rt/ppc.h) to fill this module's whole dispatch table from
+// PPCImageConfig/PPCFuncMappings (already built by {{ project }}_init.c) in
+// one pass, so `registrar` here is the guest base pointer (u8*) that
+// x360_app_run/x360_register_recompiled_module already has in scope, not a
+// per-function callback object.
+{% if is_dll %}
+#ifdef _WIN32
+#define REX_MODULE_EXPORT __declspec(dllexport)
+#else
+#define REX_MODULE_EXPORT __attribute__((visibility("default")))
+#endif
+
+REX_MODULE_EXPORT
+void ReXModule_Register(void* registrar) {
+{% else %}
+void {{ project }}_RegisterFunctions(void* registrar) {
+{% endif %}
+  x360_ppc_install_mappings((u8*)registrar, &PPCImageConfig);
+}
+
+{% if is_dll %}
+// The runtime uses this baked layout for the dispatch table. It must match the
+// constants used by this module's REX_LOOKUP_FUNC macro.
+REX_MODULE_EXPORT
+const PPCImageInfo* ReXModule_GetImageInfo(void) {
+  return &PPCImageConfig;
+}
+{% endif %}

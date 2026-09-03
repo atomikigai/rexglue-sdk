@@ -108,3 +108,7 @@ catch_discover_tests(ppc_tests
 )
 
 message(STATUS "Configured PPC test suite with ${NUM_TESTS} test files")
+
+# Independent verification for the C11 codegen backend (--lang c). See
+# tests/ppc/c_harness/CMakeLists.txt.
+add_subdirectory(c_harness)
