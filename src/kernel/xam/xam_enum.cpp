@@ -16,8 +16,11 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/flags.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
+
+#include "xam_enum.h"
 
 #if REX_PLATFORM_WIN32
 #include <rex/platform.h>
@@ -63,7 +66,20 @@ uint32_t xeXamEnumerate(uint32_t handle, uint32_t flags, mapped_void buffer_ptr,
     return result;
   } else if (overlapped_ptr) {
     assert_true(!items_returned);
-    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+    auto run_overlapped = [run, handle](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+      auto enumerator_result = run(extended_error, length);
+      const auto completion = MakeXamEnumerateOverlappedCompletion(enumerator_result, length);
+      extended_error = completion.extended_error;
+      length = completion.length;
+      if (REXCVAR_GET(xam_content_device_trace)) {
+        REXKRNL_INFO(
+            "[xam_content_device] XamEnumerate overlapped handle={:#x} result={:#x} "
+            "extended_error={:#x} length={}",
+            handle, uint32_t(completion.result), completion.extended_error, completion.length);
+      }
+      return completion.result;
+    };
+    REX_KERNEL_STATE()->CompleteOverlappedDeferredEx(run_overlapped, overlapped_ptr);
     return X_ERROR_IO_PENDING;
   } else {
     assert_always();
