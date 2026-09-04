@@ -48,6 +48,12 @@ enum class ReadbackResolveMode {
   kFull,
 };
 
+enum class ReadbackMemexportMode {
+  kOff,
+  kSync,
+  kDeferred,
+};
+
 struct SwapState {
   // Lock must be held when changing data in this structure.
   std::mutex mutex;
@@ -238,6 +244,9 @@ class CommandProcessor {
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
   bool IsReadbackMemexportEnabled(bool legacy_backend_flag) const;
+  // Shared memexport readback policy. Explicit mode selection takes priority,
+  // followed by the backend legacy flag and the shared legacy enable flag.
+  ReadbackMemexportMode GetReadbackMemexportMode(bool legacy_backend_flag) const;
 
   // Real (SDK-backed) or fallback (host-only) rex::memory::Memory obtained
   // from graphics_system->memory(): used by backend subclasses to construct

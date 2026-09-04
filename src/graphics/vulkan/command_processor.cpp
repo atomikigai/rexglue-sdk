@@ -1994,6 +1994,14 @@ void VulkanCommandProcessor::ShutdownContext() {
     }
   }
   memexport_readback_buffers_.clear();
+  FlushCompletedDeferredMemexportReadbacks();
+  for (auto& readback_pair : deferred_memexport_readback_buffers_) {
+    for (DeferredMemexportReadbackSlot& slot : readback_pair.second.slots) {
+      DestroyDeferredMemexportReadbackSlot(slot);
+    }
+  }
+  deferred_memexport_readback_buffers_.clear();
+  pending_deferred_memexport_readbacks_.clear();
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -4298,22 +4306,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
-    uint32_t memexport_total_size = 0;
-    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
-      memexport_total_size += memexport_range.size_bytes;
-    }
-    if (memexport_total_size) {
-      if (REXCVAR_GET(readback_memexport_fast)) {
-        IssueDraw_MemexportReadbackFastPath(memexport_total_size);
-      } else {
-        IssueDraw_MemexportReadbackFullPath(memexport_total_size);
-      }
-    }
+  if (!memexport_ranges_.empty()) {
+    IssueDraw_MemexportReadback();
   }
 
   return true;
+}
+
+void VulkanCommandProcessor::IssueDraw_MemexportReadback() {
+  ReadbackMemexportMode mode = GetReadbackMemexportMode(REXCVAR_GET(vulkan_readback_memexport));
+  if (mode == ReadbackMemexportMode::kOff) {
+    return;
+  }
+  uint32_t total_size = 0;
+  for (const draw_util::MemExportRange& range : memexport_ranges_) {
+    total_size += range.size_bytes;
+  }
+  if (!total_size) {
+    return;
+  }
+  if (mode == ReadbackMemexportMode::kDeferred) {
+    IssueDraw_MemexportReadbackDeferred(total_size);
+    return;
+  }
+  if (REXCVAR_GET(readback_memexport_fast)) {
+    IssueDraw_MemexportReadbackFastPath(total_size);
+  } else {
+    IssueDraw_MemexportReadbackFullPath(total_size);
+  }
 }
 
 bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_size) {
@@ -4510,6 +4530,184 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   }
 
   readback.current_index = read_index;
+  return true;
+}
+
+bool VulkanCommandProcessor::EnsureDeferredMemexportReadbackSlot(
+    DeferredMemexportReadbackBuffer& readback, size_t index, uint32_t size) {
+  if (readback.slots.size() <= index) {
+    readback.slots.resize(index + 1);
+  }
+  DeferredMemexportReadbackSlot& slot = readback.slots[index];
+  if (slot.buffer != VK_NULL_HANDLE && slot.memory != VK_NULL_HANDLE && slot.mapped_data &&
+      size <= slot.size) {
+    return true;
+  }
+
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkBuffer new_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory new_memory = VK_NULL_HANDLE;
+  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+          ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
+    return false;
+  }
+  void* new_mapping = nullptr;
+  if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
+    dfn.vkDestroyBuffer(device, new_buffer, nullptr);
+    dfn.vkFreeMemory(device, new_memory, nullptr);
+    return false;
+  }
+
+  DestroyDeferredMemexportReadbackSlot(slot);
+  slot.buffer = new_buffer;
+  slot.memory = new_memory;
+  slot.mapped_data = new_mapping;
+  slot.size = size;
+  return true;
+}
+
+void VulkanCommandProcessor::DestroyDeferredMemexportReadbackSlot(
+    DeferredMemexportReadbackSlot& slot) {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (slot.mapped_data && slot.memory != VK_NULL_HANDLE) {
+    dfn.vkUnmapMemory(device, slot.memory);
+  }
+  if (slot.buffer != VK_NULL_HANDLE) {
+    dfn.vkDestroyBuffer(device, slot.buffer, nullptr);
+  }
+  if (slot.memory != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device, slot.memory, nullptr);
+  }
+  slot = {};
+}
+
+void VulkanCommandProcessor::CommitDeferredMemexportReadbackSlot(
+    DeferredMemexportReadbackSlot& slot) {
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkMappedMemoryRange readback_memory_range = {};
+  readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  readback_memory_range.memory = slot.memory;
+  readback_memory_range.offset = 0;
+  readback_memory_range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1, &readback_memory_range);
+
+  const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(slot.mapped_data);
+  for (const MemexportReadbackRange& range : slot.ranges) {
+    uint8_t* destination = memory_->TranslatePhysical(range.address);
+    if (destination) {
+      std::memcpy(destination, readback_bytes, range.size);
+    }
+    readback_bytes += range.size;
+  }
+  slot.ranges.clear();
+}
+
+void VulkanCommandProcessor::FlushCompletedDeferredMemexportReadbacks() {
+  while (!pending_deferred_memexport_readbacks_.empty()) {
+    const PendingDeferredMemexportReadback& pending = pending_deferred_memexport_readbacks_.front();
+    auto readback_it = deferred_memexport_readback_buffers_.find(pending.key);
+    if (readback_it == deferred_memexport_readback_buffers_.end()) {
+      pending_deferred_memexport_readbacks_.pop_front();
+      continue;
+    }
+    DeferredMemexportReadbackBuffer& readback = readback_it->second;
+    uint64_t submission = readback.ring.pending_submission(pending.slot);
+    if (submission > submission_completed_) {
+      break;
+    }
+    if (submission && pending.slot < readback.slots.size()) {
+      CommitDeferredMemexportReadbackSlot(readback.slots[pending.slot]);
+      readback.ring.Release(pending.slot);
+    }
+    pending_deferred_memexport_readbacks_.pop_front();
+  }
+}
+
+void VulkanCommandProcessor::EvictOldDeferredMemexportReadbackBuffers() {
+  const uint64_t eviction_frame_floor = (frame_current_ > kReadbackBufferEvictionAgeFrames)
+                                            ? (frame_current_ - kReadbackBufferEvictionAgeFrames)
+                                            : 0;
+  for (auto it = deferred_memexport_readback_buffers_.begin();
+       it != deferred_memexport_readback_buffers_.end();) {
+    DeferredMemexportReadbackBuffer& readback = it->second;
+    bool evict = readback.ring.empty() &&
+                 (deferred_memexport_readback_buffers_.size() > kMaxReadbackBuffers ||
+                  readback.last_used_frame < eviction_frame_floor);
+    if (!evict) {
+      ++it;
+      continue;
+    }
+    for (DeferredMemexportReadbackSlot& slot : readback.slots) {
+      DestroyDeferredMemexportReadbackSlot(slot);
+    }
+    it = deferred_memexport_readback_buffers_.erase(it);
+  }
+}
+
+size_t VulkanCommandProcessor::AcquireDeferredMemexportReadbackSlot(
+    DeferredMemexportReadbackBuffer& readback) {
+  size_t slot_index = readback.ring.AcquireFreeSlot();
+  if (slot_index != DeferredReadbackRing::kInvalidSlot) {
+    return slot_index;
+  }
+  CheckSubmissionFenceAndDeviceLoss(0, FenceWaitReason::kAwaitAllMemexport);
+  FlushCompletedDeferredMemexportReadbacks();
+  slot_index = readback.ring.AcquireFreeSlot();
+  if (slot_index != DeferredReadbackRing::kInvalidSlot) {
+    return slot_index;
+  }
+  size_t oldest_slot = readback.ring.oldest_pending_slot();
+  CheckSubmissionFenceAndDeviceLoss(readback.ring.pending_submission(oldest_slot),
+                                    FenceWaitReason::kAwaitAllMemexport);
+  FlushCompletedDeferredMemexportReadbacks();
+  return readback.ring.AcquireFreeSlot();
+}
+
+bool VulkanCommandProcessor::IssueDraw_MemexportReadbackDeferred(uint32_t total_size) {
+  assert_not_zero(total_size);
+  assert_false(memexport_ranges_.empty());
+  const uint64_t readback_key =
+      MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
+  DeferredMemexportReadbackBuffer& readback = deferred_memexport_readback_buffers_[readback_key];
+  readback.last_used_frame = frame_current_;
+
+  size_t slot_index = AcquireDeferredMemexportReadbackSlot(readback);
+  if (slot_index == DeferredReadbackRing::kInvalidSlot ||
+      !EnsureDeferredMemexportReadbackSlot(readback, slot_index,
+                                           AlignReadbackBufferSize(total_size))) {
+    REXGPU_ERROR("Failed to acquire a deferred Vulkan memexport readback slot");
+    return true;
+  }
+  if (!submission_open_ && !BeginSubmission(true)) {
+    return true;
+  }
+
+  DeferredMemexportReadbackSlot& slot = readback.slots[slot_index];
+  slot.ranges.clear();
+  slot.ranges.reserve(memexport_ranges_.size());
+  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  SubmitBarriers(true);
+  uint32_t readback_offset = 0;
+  for (const draw_util::MemExportRange& range : memexport_ranges_) {
+    VkBufferCopy copy = {};
+    copy.srcOffset = range.base_address_dwords << 2;
+    copy.dstOffset = readback_offset;
+    copy.size = range.size_bytes;
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), slot.buffer, 1, &copy);
+    slot.ranges.push_back({uint32_t(copy.srcOffset), range.size_bytes});
+    readback_offset += range.size_bytes;
+  }
+  PushBufferMemoryBarrier(slot.buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_HOST_READ_BIT);
+  readback.ring.MarkPending(slot_index, GetCurrentSubmission());
+  pending_deferred_memexport_readbacks_.push_back({readback_key, slot_index});
   return true;
 }
 
@@ -5275,6 +5473,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
+  FlushCompletedDeferredMemexportReadbacks();
 
   if (is_opening_frame) {
     CountSwapTraceEvent(swap_trace_frame_opens_);
@@ -5381,6 +5580,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
+    EvictOldDeferredMemexportReadbackBuffers();
 
     primitive_processor_->BeginFrame();
 

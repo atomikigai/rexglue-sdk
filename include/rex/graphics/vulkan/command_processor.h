@@ -25,6 +25,7 @@
 
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/deferred_readback_ring.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -459,8 +460,10 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
+  void IssueDraw_MemexportReadback();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+  bool IssueDraw_MemexportReadbackDeferred(uint32_t total_size);
 
   void SplitPendingBarrier();
 
@@ -487,6 +490,33 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint64_t last_used_frame = 0;
   };
   void EvictOldReadbackBuffers(std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map);
+  struct MemexportReadbackRange {
+    uint32_t address = 0;
+    uint32_t size = 0;
+  };
+  struct DeferredMemexportReadbackSlot {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    void* mapped_data = nullptr;
+    uint32_t size = 0;
+    std::vector<MemexportReadbackRange> ranges;
+  };
+  struct DeferredMemexportReadbackBuffer {
+    DeferredReadbackRing ring;
+    std::vector<DeferredMemexportReadbackSlot> slots;
+    uint64_t last_used_frame = 0;
+  };
+  struct PendingDeferredMemexportReadback {
+    uint64_t key = 0;
+    size_t slot = DeferredReadbackRing::kInvalidSlot;
+  };
+  bool EnsureDeferredMemexportReadbackSlot(DeferredMemexportReadbackBuffer& readback, size_t index,
+                                           uint32_t size);
+  size_t AcquireDeferredMemexportReadbackSlot(DeferredMemexportReadbackBuffer& readback);
+  void CommitDeferredMemexportReadbackSlot(DeferredMemexportReadbackSlot& slot);
+  void FlushCompletedDeferredMemexportReadbacks();
+  void DestroyDeferredMemexportReadbackSlot(DeferredMemexportReadbackSlot& slot);
+  void EvictOldDeferredMemexportReadbackBuffers();
   static constexpr uint32_t kReadbackBufferSizeIncrement = 16 * 1024 * 1024;
   static constexpr size_t kMaxReadbackBuffers = 256;
   static constexpr uint64_t kReadbackBufferEvictionAgeFrames = 60;
@@ -828,6 +858,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  std::unordered_map<uint64_t, DeferredMemexportReadbackBuffer>
+      deferred_memexport_readback_buffers_;
+  std::deque<PendingDeferredMemexportReadback> pending_deferred_memexport_readbacks_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

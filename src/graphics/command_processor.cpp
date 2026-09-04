@@ -65,6 +65,14 @@ REXCVAR_DEFINE_BOOL(readback_memexport, true, "GPU",
                     "coherency (can reduce correctness issues, but may add GPU/CPU sync cost)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_STRING(readback_memexport_mode, "sync", "GPU",
+                      "Controls CPU readback of shader memexport writes.\n"
+                      " sync: Immediate readback with blocking fallback (default)\n"
+                      " deferred: Copy completed submissions without blocking draws\n"
+                      " off: Disable memexport readback")
+    .allowed({"sync", "deferred", "off"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "Use fast double-buffered memexport readback when possible, with "
                     "automatic fallback to full synchronous readback")
@@ -98,6 +106,16 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
     return ReadbackResolveMode::kFull;
   }
   return ReadbackResolveMode::kDisabled;
+}
+
+ReadbackMemexportMode ParseReadbackMemexportMode(std::string_view value) {
+  if (value == "deferred") {
+    return ReadbackMemexportMode::kDeferred;
+  }
+  if (value == "off") {
+    return ReadbackMemexportMode::kOff;
+  }
+  return ReadbackMemexportMode::kSync;
 }
 
 // Logs a [HOST_THREAD] line with `name` and this thread's OS id (matching the
@@ -202,11 +220,20 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
-    return legacy_backend_flag;
+  return GetReadbackMemexportMode(legacy_backend_flag) != ReadbackMemexportMode::kOff;
+}
+
+ReadbackMemexportMode CommandProcessor::GetReadbackMemexportMode(bool legacy_backend_flag) const {
+  if (rex::cvar::GetFlagSource("readback_memexport_mode") != rex::cvar::Source::kDefault) {
+    return ParseReadbackMemexportMode(REXCVAR_GET(readback_memexport_mode));
   }
-  return REXCVAR_GET(readback_memexport);
+  if (legacy_readback_memexport_cvar_name_ &&
+      rex::cvar::GetFlagSource(legacy_readback_memexport_cvar_name_) !=
+          rex::cvar::Source::kDefault) {
+    return legacy_backend_flag ? ReadbackMemexportMode::kSync : ReadbackMemexportMode::kOff;
+  }
+  return REXCVAR_GET(readback_memexport) ? ReadbackMemexportMode::kSync
+                                         : ReadbackMemexportMode::kOff;
 }
 
 void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect) {
