@@ -17,6 +17,7 @@ REXCVAR_DECLARE(bool, headless);
 REXCVAR_DECLARE(bool, log_high_frequency_kernel_calls);
 REXCVAR_DECLARE(bool, profile_settings_trace);
 REXCVAR_DECLARE(bool, file_lifecycle_trace);
+REXCVAR_DECLARE(bool, xam_content_device_trace);
 REXCVAR_DECLARE(uint32_t, license_mask);
 REXCVAR_DECLARE(uint32_t, user_country);
 REXCVAR_DECLARE(uint32_t, user_language);

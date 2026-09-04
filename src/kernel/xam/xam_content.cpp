@@ -16,6 +16,7 @@
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/string.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
@@ -63,10 +64,24 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
                                      mapped_u32 buffer_size_ptr, mapped_u32 handle_out) {
   assert_not_null(handle_out);
 
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentCreateEnumerator user={} device_id={:#x} "
+        "content_type={:#x} flags={:#x} items_per_enumerate={}",
+        uint32_t(user_index), uint32_t(device_id), uint32_t(content_type), uint32_t(content_flags),
+        uint32_t(items_per_enumerate));
+  }
+
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
   if ((device_id && device_info == nullptr) || !handle_out) {
     if (buffer_size_ptr) {
       *buffer_size_ptr = 0;
+    }
+    if (REXCVAR_GET(xam_content_device_trace)) {
+      REXKRNL_INFO(
+          "[xam_content_device] XamContentCreateEnumerator device_id={:#x} -> result={:#x} "
+          "(invalid device or null handle_out)",
+          uint32_t(device_id), uint32_t(X_E_INVALIDARG));
     }
     return X_E_INVALIDARG;
   }
@@ -80,6 +95,10 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   auto e = make_object<XStaticEnumerator<XCONTENT_DATA>>(REX_KERNEL_STATE(), items_per_enumerate);
   auto result = e->Initialize(0xFF, 0xFE, 0x20005, 0x20007, 0);
   if (XFAILED(result)) {
+    if (REXCVAR_GET(xam_content_device_trace)) {
+      REXKRNL_INFO("[xam_content_device] XamContentCreateEnumerator Initialize failed result={:#x}",
+                   uint32_t(result));
+    }
     return result;
   }
 
@@ -110,6 +129,12 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
   REXKRNL_DEBUG("XamContentCreateEnumerator: added {} items to enumerator", e->item_count());
 
   *handle_out = e->handle();
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentCreateEnumerator device_id={:#x} -> items={} handle={:#x} "
+        "result={:#x}",
+        uint32_t(device_id), e->item_count(), e->handle(), uint32_t(X_ERROR_SUCCESS));
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -139,6 +164,15 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
 
   if (overlapped_ptr && disposition_ptr) {
     *disposition_ptr = 0;
+  }
+
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentCreate* user={} root_name='{}' device_id={:#x} "
+        "content_type={:#x} file_name='{}' flags={:#x} cache_size={} content_size={} async={}",
+        uint32_t(user_index), root_name.value(), uint32_t(content_data.device_id),
+        static_cast<uint32_t>(content_data.content_type.get()), content_data.file_name(),
+        uint32_t(flags), cache_size, content_size, bool(overlapped_ptr));
   }
 
   auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
@@ -224,6 +258,14 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
 
+    if (REXCVAR_GET(xam_content_device_trace)) {
+      REXKRNL_INFO(
+          "[xam_content_device] XamContentCreate* root_name='{}' file_name='{}' -> "
+          "disposition={} license={:#x} result={:#x}",
+          root_name, content_data.file_name(), static_cast<uint32_t>(disposition), content_license,
+          uint32_t(result));
+    }
+
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
     return result;
@@ -270,6 +312,12 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   X_RESULT result = X_ERROR_SUCCESS;
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    // NOTE: this is a no-op today; it never calls into content_manager, so
+    // it always reports success regardless of whether root_name is open.
+    REXKRNL_INFO("[xam_content_device] XamContentFlush root_name='{}' -> result={:#x} (no-op)",
+                 root_name.value(), uint32_t(result));
+  }
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -281,6 +329,11 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO("[xam_content_device] XamContentClose root_name='{}' -> result={:#x}",
+                 root_name.value(), uint32_t(result));
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
@@ -388,6 +441,15 @@ u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
 
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentDelete user={} device_id={:#x} content_type={:#x} "
+        "file_name='{}' -> result={:#x}",
+        uint32_t(user_index), uint32_t(content_data.device_id),
+        static_cast<uint32_t>(content_data.content_type.get()), content_data.file_name(),
+        uint32_t(result));
+  }
+
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -403,6 +465,14 @@ u32 XamContentDeleteInternal_entry(mapped_void content_data_ptr, mapped_void ove
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_AGGREGATE_DATA*>();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);
+
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentDeleteInternal device_id={:#x} content_type={:#x} "
+        "file_name='{}' -> result={:#x}",
+        uint32_t(content_data.device_id), static_cast<uint32_t>(content_data.content_type.get()),
+        content_data.file_name(), uint32_t(result));
+  }
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

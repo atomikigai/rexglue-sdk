@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/filesystem/file.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -17,6 +18,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/string/numeric.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xam/content_device.h>
@@ -83,8 +85,21 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
                                               mapped_u32 handle_out) {
   assert_not_null(handle_out);
 
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentAggregateCreateEnumerator xuid={:#x} device_id={:#x} "
+        "content_type={:#x}",
+        xuid, uint32_t(device_id), uint32_t(content_type));
+  }
+
   auto device_info = device_id == 0 ? nullptr : GetDummyDeviceInfo(device_id);
   if ((device_id && device_info == nullptr) || !handle_out) {
+    if (REXCVAR_GET(xam_content_device_trace)) {
+      REXKRNL_INFO(
+          "[xam_content_device] XamContentAggregateCreateEnumerator device_id={:#x} -> "
+          "result={:#x} (invalid device or null handle_out)",
+          uint32_t(device_id), uint32_t(X_E_INVALIDARG));
+    }
     return X_E_INVALIDARG;
   }
 
@@ -147,6 +162,12 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
                 e->item_count());
 
   *handle_out = e->handle();
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentAggregateCreateEnumerator device_id={:#x} -> items={} "
+        "handle={:#x} result={:#x}",
+        uint32_t(device_id), e->item_count(), e->handle(), uint32_t(X_ERROR_SUCCESS));
+  }
   return X_ERROR_SUCCESS;
 }
 

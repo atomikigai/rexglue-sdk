@@ -508,9 +508,16 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
                 uint64_t(total_requested), device_id_ptr.guest_address(),
                 overlapped.guest_address());
   return xeXamDispatchHeadless(
-      [device_id_ptr]() -> X_RESULT {
+      [device_id_ptr, user_index, content_type, content_flags, total_requested]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc
         *device_id_ptr = 0x00000001;
+        if (REXCVAR_GET(xam_content_device_trace)) {
+          REXKRNL_INFO(
+              "[xam_content_device] XamShowDeviceSelectorUI user={} content_type={:#x} "
+              "flags={:#x} total_requested={} -> device_id={:#x} result={:#x}",
+              uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
+              uint64_t(total_requested), uint32_t(*device_id_ptr), uint32_t(X_ERROR_SUCCESS));
+        }
         return X_ERROR_SUCCESS;
       },
       overlapped.guest_address());

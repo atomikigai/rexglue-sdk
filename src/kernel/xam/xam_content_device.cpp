@@ -9,15 +9,29 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
 #include <rex/system/xtypes.h>
+
+// Low-volume trace of Xam content-container and storage-device API calls
+// (create/open/close/delete/enumerate content, get device data/state/name,
+// enumerate devices, device selector UI) with their arguments and return
+// values. Off by default; every call site below is gated so that no string
+// is formatted or constructed while this cvar is false. Follows the same
+// pattern as file_lifecycle_trace (src/kernel/xboxkrnl/xboxkrnl_io.cpp) and
+// profile_settings_trace (src/system/xam/user_profile.cpp).
+REXCVAR_DEFINE_BOOL(xam_content_device_trace, false, "Kernel",
+                    "Log Xam content-container and storage-device API calls (create, open/close, "
+                    "delete, enumerate content; device data/state/name, device enumeration, "
+                    "device selector UI) with arguments and return values");
 
 namespace rex {
 namespace kernel {
@@ -63,37 +77,63 @@ const DummyDeviceInfo* GetDummyDeviceInfo(uint32_t device_id) {
   return it == end ? nullptr : *it;
 }
 
+namespace {
+
+// Logs one content/device API call. Only invoked from call sites already
+// gated on REXCVAR_GET(xam_content_device_trace), so no formatting happens
+// when the trace is disabled.
+void TraceContentDeviceCall(const char* api, uint32_t device_id, const DummyDeviceInfo* device_info,
+                            uint32_t result) {
+  if (device_info) {
+    REXKRNL_INFO(
+        "[xam_content_device] {} device_id={:#x} found=true type={} total_bytes={} "
+        "free_bytes={} result={:#x}",
+        api, device_id, static_cast<uint32_t>(device_info->device_type), device_info->total_bytes,
+        device_info->free_bytes, result);
+  } else {
+    REXKRNL_INFO("[xam_content_device] {} device_id={:#x} found=false result={:#x}", api, device_id,
+                 result);
+  }
+}
+
+}  // namespace
+
 u32 XamContentGetDeviceName_entry(u32 device_id, mapped_wstring name_buffer, u32 name_capacity) {
   auto device_info = GetDummyDeviceInfo(device_id);
+  u32 result = X_ERROR_SUCCESS;
   if (device_info == nullptr) {
-    return X_ERROR_DEVICE_NOT_CONNECTED;
+    result = X_ERROR_DEVICE_NOT_CONNECTED;
+  } else {
+    auto name = std::u16string(device_info->name);
+    if (name_capacity < name.size() + 1) {
+      result = X_ERROR_INSUFFICIENT_BUFFER;
+    } else {
+      rex::string::copy_and_swap_truncating(name_buffer, name, name_capacity);
+    }
   }
-  auto name = std::u16string(device_info->name);
-  if (name_capacity < name.size() + 1) {
-    return X_ERROR_INSUFFICIENT_BUFFER;
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    TraceContentDeviceCall("XamContentGetDeviceName", device_id, device_info, result);
   }
-  rex::string::copy_and_swap_truncating(name_buffer, name, name_capacity);
-  return X_ERROR_SUCCESS;
+  return result;
 }
 
 u32 XamContentGetDeviceState_entry(u32 device_id, mapped_void overlapped_ptr) {
   auto device_info = GetDummyDeviceInfo(device_id);
-  if (device_info == nullptr) {
-    if (overlapped_ptr) {
-      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
-          overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED, 0);
-      return X_ERROR_IO_PENDING;
-    } else {
-      return X_ERROR_DEVICE_NOT_CONNECTED;
-    }
+  X_RESULT result = device_info ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    TraceContentDeviceCall("XamContentGetDeviceState", device_id, device_info, result);
   }
   if (overlapped_ptr) {
-    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
-                                                    X_ERROR_SUCCESS);
+    if (device_info == nullptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediateEx(
+          overlapped_ptr.guest_address(), X_ERROR_FUNCTION_FAILED, X_ERROR_DEVICE_NOT_CONNECTED, 0);
+    } else {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_SUCCESS);
+    }
     return X_ERROR_IO_PENDING;
-  } else {
-    return X_ERROR_SUCCESS;
   }
+  return result;
 }
 
 typedef struct {
@@ -110,17 +150,22 @@ static_assert_size(X_CONTENT_DEVICE_DATA, 0x50);
 
 u32 XamContentGetDeviceData_entry(u32 device_id, ppc_ptr_t<X_CONTENT_DEVICE_DATA> device_data) {
   auto device_info = GetDummyDeviceInfo(device_id);
+  u32 result = X_ERROR_SUCCESS;
   if (device_info == nullptr) {
-    return X_ERROR_DEVICE_NOT_CONNECTED;
+    result = X_ERROR_DEVICE_NOT_CONNECTED;
+  } else {
+    device_data.Zero();
+    device_data->device_id = static_cast<uint32_t>(device_info->device_id);
+    device_data->device_type = static_cast<uint32_t>(device_info->device_type);
+    device_data->total_bytes = device_info->total_bytes;
+    device_data->free_bytes = device_info->free_bytes;
+    rex::string::copy_and_swap_truncating(device_data->name_chars, device_info->name,
+                                          rex::countof(device_data->name_chars));
   }
-  device_data.Zero();
-  device_data->device_id = static_cast<uint32_t>(device_info->device_id);
-  device_data->device_type = static_cast<uint32_t>(device_info->device_type);
-  device_data->total_bytes = device_info->total_bytes;
-  device_data->free_bytes = device_info->free_bytes;
-  rex::string::copy_and_swap_truncating(device_data->name_chars, device_info->name,
-                                        rex::countof(device_data->name_chars));
-  return X_ERROR_SUCCESS;
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    TraceContentDeviceCall("XamContentGetDeviceData", device_id, device_info, result);
+  }
+  return result;
 }
 
 u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, u32 max_count,
@@ -134,6 +179,12 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
   auto e = make_object<XStaticEnumerator<X_CONTENT_DEVICE_DATA>>(REX_KERNEL_STATE(), max_count);
   auto result = e->Initialize(0xFE, 0xFE, 0x2000A, 0x20009, 0);
   if (XFAILED(result)) {
+    if (REXCVAR_GET(xam_content_device_trace)) {
+      REXKRNL_INFO(
+          "[xam_content_device] XamContentCreateDeviceEnumerator content_type={:#x} "
+          "flags={:#x} max_count={} -> Initialize failed result={:#x}",
+          content_type, content_flags, max_count, uint32_t(result));
+    }
     return result;
   }
 
@@ -152,6 +203,13 @@ u32 XamContentCreateDeviceEnumerator_entry(u32 content_type, u32 content_flags, 
   }
 
   *handle_out = e->handle();
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentCreateDeviceEnumerator content_type={:#x} flags={:#x} "
+        "max_count={} -> items={} handle={:#x} result={:#x}",
+        content_type, content_flags, max_count, e->item_count(), e->handle(),
+        uint32_t(X_ERROR_SUCCESS));
+  }
   return X_ERROR_SUCCESS;
 }
 
