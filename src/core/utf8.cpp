@@ -28,11 +28,30 @@ using utf8_citer = utfcpp::iterator<std::string_view::const_iterator>;
 namespace rex::string {
 
 std::string to_utf8(const std::u16string_view source) {
-  return utfcpp::utf16to8(source);
+  constexpr uint32_t kReplacementCharacter = 0xFFFD;
+  auto input = source.substr(0, source.find(u'\0'));
+  std::string result;
+  result.reserve(input.size());
+
+  for (size_t i = 0; i < input.size(); ++i) {
+    uint32_t code_point = input[i];
+    if (code_point >= 0xD800 && code_point <= 0xDBFF) {
+      if (i + 1 < input.size() && input[i + 1] >= 0xDC00 && input[i + 1] <= 0xDFFF) {
+        code_point = 0x10000 + ((code_point - 0xD800) << 10) + (input[++i] - 0xDC00);
+      } else {
+        code_point = kReplacementCharacter;
+      }
+    } else if (code_point >= 0xDC00 && code_point <= 0xDFFF) {
+      code_point = kReplacementCharacter;
+    }
+    utfcpp::append(code_point, result);
+  }
+  return result;
 }
 
 std::u16string to_utf16(const std::string_view source) {
-  return utfcpp::utf8to16(source);
+  auto input = source.substr(0, source.find('\0'));
+  return utfcpp::utf8to16(utfcpp::replace_invalid(input));
 }
 
 std::string to_string(char32_t c) {

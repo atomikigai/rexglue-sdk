@@ -48,6 +48,40 @@ namespace rex::system {
 
 constexpr uint32_t kDeferredOverlappedDelayMillis = 100;
 
+template <typename Running, typename CriticalRegion, typename DispatchQueue,
+          typename DispatchCondition>
+uint32_t RunKernelDispatchThread(Running& running, CriticalRegion& critical_region,
+                                 DispatchQueue& queue, DispatchCondition& condition) {
+  auto global_lock = critical_region.AcquireDeferred();
+  while (running) {
+    global_lock.lock();
+    if (queue.empty()) {
+      condition.wait(global_lock);
+      if (!running) {
+        global_lock.unlock();
+        break;
+      }
+    }
+    auto fn = std::move(queue.front());
+    queue.pop_front();
+    REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)", queue.size());
+    global_lock.unlock();
+
+    // Completion wrappers should translate operation failures to their
+    // overlapped result. Keep this final guard non-fatal so an unexpected
+    // callback exception cannot take down the entire runtime.
+    try {
+      fn();
+    } catch (const std::exception& e) {
+      REXSYS_ERROR("Dispatch thread: deferred completion threw '{}'", e.what());
+    } catch (...) {
+      REXSYS_ERROR("Dispatch thread: deferred completion threw non-std exception");
+    }
+    REXSYS_NOISY_DEBUG("Dispatch thread completed item");
+  }
+  return 0;
+}
+
 // This is a global object initialized with the XboxkrnlModule.
 // It references the current kernel state object that all kernel methods should
 // be using to stash their variables.
@@ -649,34 +683,8 @@ void KernelState::SetExecutableModule(object_ref<UserModule> module) {
   if (!dispatch_thread_running_) {
     dispatch_thread_running_ = true;
     dispatch_thread_ = object_ref<XHostThread>(new XHostThread(this, 128 * 1024, 0, [this]() {
-      auto global_lock = global_critical_region_.AcquireDeferred();
-      while (dispatch_thread_running_) {
-        global_lock.lock();
-        if (dispatch_queue_.empty()) {
-          dispatch_cond_.wait(global_lock);
-          if (!dispatch_thread_running_) {
-            global_lock.unlock();
-            break;
-          }
-        }
-        auto fn = std::move(dispatch_queue_.front());
-        dispatch_queue_.pop_front();
-        REXSYS_NOISY_DEBUG("Dispatch thread processing queued item ({} remaining)",
-                           dispatch_queue_.size());
-        global_lock.unlock();
-
-        // Throws out of fn leave the originating overlapped uncompleted and
-        // the waiting guest thread stuck; fail visibly rather than swallow.
-        try {
-          fn();
-        } catch (const std::exception& e) {
-          REX_FATAL("Dispatch thread: deferred completion threw '{}'", e.what());
-        } catch (...) {
-          REX_FATAL("Dispatch thread: deferred completion threw non-std exception");
-        }
-        REXSYS_NOISY_DEBUG("Dispatch thread completed item");
-      }
-      return 0;
+      return RunKernelDispatchThread(dispatch_thread_running_, global_critical_region_,
+                                     dispatch_queue_, dispatch_cond_);
     }));
     dispatch_thread_->set_name("Kernel Dispatch");
     X_STATUS create_status = dispatch_thread_->Create();
@@ -1230,21 +1238,44 @@ void KernelState::CompleteOverlappedDeferredEx(
   dispatch_queue_.push_back(
       [this, completion_callback, overlapped_ptr, pre_callback, post_callback]() {
         REXSYS_DEBUG("Deferred overlapped {:08X}: running pre_callback", overlapped_ptr);
-        if (pre_callback) {
-          pre_callback();
+        uint32_t extended_error = X_HRESULT_FROM_WIN32(X_ERROR_FUNCTION_FAILED);
+        uint32_t length = 0;
+        X_RESULT result = X_ERROR_FUNCTION_FAILED;
+        try {
+          if (pre_callback) {
+            pre_callback();
+          }
+          REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
+                       kDeferredOverlappedDelayMillis);
+          rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
+          REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
+          result = completion_callback(extended_error, length);
+        } catch (const std::exception& e) {
+          REXSYS_ERROR("Deferred overlapped {:08X} failed with exception: {}", overlapped_ptr,
+                       e.what());
+          result = X_ERROR_FUNCTION_FAILED;
+          extended_error = X_HRESULT_FROM_WIN32(result);
+          length = 0;
+        } catch (...) {
+          REXSYS_ERROR("Deferred overlapped {:08X} failed with non-std exception", overlapped_ptr);
+          result = X_ERROR_FUNCTION_FAILED;
+          extended_error = X_HRESULT_FROM_WIN32(result);
+          length = 0;
         }
-        REXSYS_DEBUG("Deferred overlapped {:08X}: sleeping {}ms", overlapped_ptr,
-                     kDeferredOverlappedDelayMillis);
-        rex::thread::Sleep(std::chrono::milliseconds(kDeferredOverlappedDelayMillis));
-        uint32_t extended_error, length;
-        REXSYS_DEBUG("Deferred overlapped {:08X}: running completion", overlapped_ptr);
-        auto result = completion_callback(extended_error, length);
         REXSYS_DEBUG("Deferred overlapped {:08X}: completing with result {:08X}", overlapped_ptr,
                      result);
         CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
         if (post_callback) {
-          REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
-          post_callback();
+          try {
+            REXSYS_DEBUG("Deferred overlapped {:08X}: running post_callback", overlapped_ptr);
+            post_callback();
+          } catch (const std::exception& e) {
+            REXSYS_ERROR("Deferred overlapped {:08X} post-callback threw: {}", overlapped_ptr,
+                         e.what());
+          } catch (...) {
+            REXSYS_ERROR("Deferred overlapped {:08X} post-callback threw non-std exception",
+                         overlapped_ptr);
+          }
         }
       });
   dispatch_cond_.notify_all();

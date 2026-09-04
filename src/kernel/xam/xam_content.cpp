@@ -30,6 +30,27 @@ namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
 
+template <typename Callback>
+X_RESULT RunContentCreateSafely(Callback& callback, const std::string_view root_name,
+                                mapped_u32 disposition_ptr, uint32_t& extended_error,
+                                uint32_t& length) {
+  try {
+    return callback(extended_error, length);
+  } catch (const std::exception& e) {
+    REXKRNL_ERROR("XamContentCreate* root_name='{}' failed with exception: {}", root_name,
+                  e.what());
+  } catch (...) {
+    REXKRNL_ERROR("XamContentCreate* root_name='{}' failed with non-std exception", root_name);
+  }
+
+  if (disposition_ptr) {
+    *disposition_ptr = 0;
+  }
+  extended_error = X_HRESULT_FROM_WIN32(X_ERROR_FUNCTION_FAILED);
+  length = 0;
+  return X_ERROR_FUNCTION_FAILED;
+}
+
 u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_ptr) {
   // Each bit in the mask represents a granted license. Available licenses
   // seems to vary from game to game, but most appear to use bit 0 to indicate
@@ -140,6 +161,115 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
 
 enum class kDispositionState : uint32_t { Unknown = 0, Create = 1, Open = 2 };
 
+X_RESULT ResolveCreateNew(ContentManager* content_manager, uint64_t xuid,
+                          const XCONTENT_AGGREGATE_DATA& content_data,
+                          kDispositionState& disposition) {
+  if (content_manager->ContentExists(xuid, content_data)) {
+    return X_ERROR_ALREADY_EXISTS;
+  }
+  disposition = kDispositionState::Create;
+  return X_ERROR_INVALID_PARAMETER;
+}
+
+X_RESULT ResolveCreateAlways(ContentManager* content_manager, const std::string_view root_name,
+                             uint64_t xuid, const XCONTENT_AGGREGATE_DATA& content_data,
+                             kDispositionState& disposition) {
+  content_manager->CloseContent(root_name);
+  if (content_manager->ContentExists(xuid, content_data)) {
+    content_manager->DeleteContent(xuid, content_data);
+  }
+  disposition = content_manager->ContentExists(xuid, content_data) ? kDispositionState::Open
+                                                                   : kDispositionState::Create;
+  return X_ERROR_INVALID_PARAMETER;
+}
+
+X_RESULT ResolveOpenExisting(ContentManager* content_manager, uint64_t xuid,
+                             const XCONTENT_AGGREGATE_DATA& content_data,
+                             kDispositionState& disposition) {
+  if (!content_manager->ContentExists(xuid, content_data)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  disposition = kDispositionState::Open;
+  return X_ERROR_INVALID_PARAMETER;
+}
+
+X_RESULT ResolveOpenAlways(ContentManager* content_manager, uint64_t xuid,
+                           const XCONTENT_AGGREGATE_DATA& content_data,
+                           kDispositionState& disposition) {
+  disposition = content_manager->ContentExists(xuid, content_data) ? kDispositionState::Open
+                                                                   : kDispositionState::Create;
+  return X_ERROR_INVALID_PARAMETER;
+}
+
+X_RESULT ResolveTruncateExisting(ContentManager* content_manager, const std::string_view root_name,
+                                 uint64_t xuid, const XCONTENT_AGGREGATE_DATA& content_data,
+                                 kDispositionState& disposition) {
+  if (!content_manager->ContentExists(xuid, content_data)) {
+    return X_ERROR_PATH_NOT_FOUND;
+  }
+  content_manager->CloseContent(root_name);
+  content_manager->DeleteContent(xuid, content_data);
+  disposition = content_manager->ContentExists(xuid, content_data) ? kDispositionState::Open
+                                                                   : kDispositionState::Create;
+  return X_ERROR_INVALID_PARAMETER;
+}
+
+X_RESULT ResolveContentDisposition(ContentManager* content_manager,
+                                   const std::string_view root_name, uint64_t xuid,
+                                   const XCONTENT_AGGREGATE_DATA& content_data, uint32_t flags,
+                                   kDispositionState& disposition) {
+  switch (flags & 0xF) {
+    case 1:
+      return ResolveCreateNew(content_manager, xuid, content_data, disposition);
+    case 2:
+      return ResolveCreateAlways(content_manager, root_name, xuid, content_data, disposition);
+    case 3:
+      return ResolveOpenExisting(content_manager, xuid, content_data, disposition);
+    case 4:
+      return ResolveOpenAlways(content_manager, xuid, content_data, disposition);
+    case 5:
+      return ResolveTruncateExisting(content_manager, root_name, xuid, content_data, disposition);
+    default:
+      assert_unhandled_case(flags & 0xF);
+      return X_ERROR_INVALID_PARAMETER;
+  }
+}
+
+X_RESULT ExecuteContentDisposition(ContentManager* content_manager,
+                                   const std::string_view root_name, uint64_t xuid,
+                                   const XCONTENT_AGGREGATE_DATA& content_data,
+                                   kDispositionState disposition, X_RESULT result,
+                                   mapped_u32 disposition_ptr, mapped_u32 license_mask_ptr,
+                                   uint32_t& extended_error, uint32_t& length) {
+  uint32_t content_license = 0;
+  if (disposition == kDispositionState::Create) {
+    result = content_manager->CreateContent(root_name, xuid, content_data);
+    if (XSUCCEEDED(result)) {
+      content_manager->WriteContentHeaderFile(xuid, content_data);
+    }
+  } else if (disposition == kDispositionState::Open) {
+    result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+  }
+
+  if (license_mask_ptr && XSUCCEEDED(result)) {
+    *license_mask_ptr = content_license;
+  }
+  if (disposition_ptr) {
+    *disposition_ptr = static_cast<uint32_t>(disposition);
+  }
+  if (REXCVAR_GET(xam_content_device_trace)) {
+    REXKRNL_INFO(
+        "[xam_content_device] XamContentCreate* root_name='{}' file_name='{}' -> "
+        "disposition={} license={:#x} result={:#x}",
+        root_name, content_data.file_name(), static_cast<uint32_t>(disposition), content_license,
+        uint32_t(result));
+  }
+
+  extended_error = X_HRESULT_FROM_WIN32(result);
+  length = static_cast<uint32_t>(disposition);
+  return result;
+}
+
 u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void content_data_ptr,
                        u32 content_data_size, u32 flags, mapped_u32 disposition_ptr,
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
@@ -175,100 +305,25 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         uint32_t(flags), cache_size, content_size, bool(overlapped_ptr));
   }
 
-  auto run = [content_manager, xuid, root_name = root_name.value(), flags, content_data,
-              disposition_ptr,
-              license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
-    X_RESULT result = X_ERROR_INVALID_PARAMETER;
+  // The guest may reuse the root-name buffer while the deferred completion is
+  // waiting. Own and sanitize it before queuing instead of capturing a view
+  // into mutable guest memory.
+  const auto owned_root_name = rex::string::to_utf8(rex::string::to_utf16(root_name.value()));
+  auto run_unchecked = [content_manager, xuid, root_name = owned_root_name, flags, content_data,
+                        disposition_ptr,
+                        license_mask_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
     kDispositionState disposition = kDispositionState::Unknown;
-    switch (flags & 0xF) {
-      case 1:  // CREATE_NEW
-               // Fail if exists.
-        if (content_manager->ContentExists(xuid, content_data)) {
-          result = X_ERROR_ALREADY_EXISTS;
-        } else {
-          disposition = kDispositionState::Create;
-        }
-        break;
-      case 2:  // CREATE_ALWAYS
-               // Overwrite existing, if any.
-        // Close any existing mount under this root name first.
-        // Games may reuse the same root without explicitly closing.
-        content_manager->CloseContent(root_name);
-        if (content_manager->ContentExists(xuid, content_data)) {
-          content_manager->DeleteContent(xuid, content_data);
-        }
-        // Check filesystem state after deletion attempt to decide
-        // whether to create fresh or open existing.
-        if (content_manager->ContentExists(xuid, content_data)) {
-          disposition = kDispositionState::Open;
-        } else {
-          disposition = kDispositionState::Create;
-        }
-        break;
-      case 3:  // OPEN_EXISTING
-               // Open only if exists.
-        if (!content_manager->ContentExists(xuid, content_data)) {
-          result = X_ERROR_PATH_NOT_FOUND;
-        } else {
-          disposition = kDispositionState::Open;
-        }
-        break;
-      case 4:  // OPEN_ALWAYS
-               // Create if needed.
-        if (!content_manager->ContentExists(xuid, content_data)) {
-          disposition = kDispositionState::Create;
-        } else {
-          disposition = kDispositionState::Open;
-        }
-        break;
-      case 5:  // TRUNCATE_EXISTING
-               // Fail if doesn't exist, if does exist delete and recreate.
-        if (!content_manager->ContentExists(xuid, content_data)) {
-          result = X_ERROR_PATH_NOT_FOUND;
-        } else {
-          content_manager->CloseContent(root_name);
-          content_manager->DeleteContent(xuid, content_data);
-          if (content_manager->ContentExists(xuid, content_data)) {
-            disposition = kDispositionState::Open;
-          } else {
-            disposition = kDispositionState::Create;
-          }
-        }
-        break;
-      default:
-        assert_unhandled_case(flags & 0xF);
-        break;
-    }
+    auto result = ResolveContentDisposition(content_manager, root_name, xuid, content_data, flags,
+                                            disposition);
+    return ExecuteContentDisposition(content_manager, root_name, xuid, content_data, disposition,
+                                     result, disposition_ptr, license_mask_ptr, extended_error,
+                                     length);
+  };
 
-    uint32_t content_license = 0;
-    if (disposition == kDispositionState::Create) {
-      result = content_manager->CreateContent(root_name, xuid, content_data);
-      if (XSUCCEEDED(result)) {
-        content_manager->WriteContentHeaderFile(xuid, content_data);
-      }
-    } else if (disposition == kDispositionState::Open) {
-      result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
-    }
-
-    if (license_mask_ptr && XSUCCEEDED(result)) {
-      *license_mask_ptr = content_license;
-    }
-
-    if (disposition_ptr) {
-      *disposition_ptr = static_cast<uint32_t>(disposition);
-    }
-
-    if (REXCVAR_GET(xam_content_device_trace)) {
-      REXKRNL_INFO(
-          "[xam_content_device] XamContentCreate* root_name='{}' file_name='{}' -> "
-          "disposition={} license={:#x} result={:#x}",
-          root_name, content_data.file_name(), static_cast<uint32_t>(disposition), content_license,
-          uint32_t(result));
-    }
-
-    extended_error = X_HRESULT_FROM_WIN32(result);
-    length = static_cast<uint32_t>(disposition);
-    return result;
+  auto run = [run_unchecked = std::move(run_unchecked), root_name = owned_root_name,
+              disposition_ptr](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+    return RunContentCreateSafely(run_unchecked, root_name, disposition_ptr, extended_error,
+                                  length);
   };
 
   if (!overlapped_ptr) {

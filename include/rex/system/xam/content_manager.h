@@ -64,13 +64,22 @@ struct XCONTENT_DATA {
   }
 
   std::u16string display_name() const {
-    return memory::load_and_swap<std::u16string>(display_name_raw.uint);
+    std::u16string value;
+    value.reserve(countof(display_name_raw.uint));
+    for (const auto& raw_char : display_name_raw.uint) {
+      auto c = memory::load_and_swap<uint16_t>(&raw_char);
+      if (!c) {
+        break;
+      }
+      value.push_back(static_cast<char16_t>(c));
+    }
+    return value;
   }
 
   std::string file_name() const {
-    std::string value;
-    value.assign(file_name_raw, std::min(strlen(file_name_raw), countof(file_name_raw)));
-    return value;
+    auto end = std::find(std::begin(file_name_raw), std::end(file_name_raw), '\0');
+    auto value = std::string(file_name_raw, end);
+    return rex::string::to_utf8(rex::string::to_utf16(value));
   }
 
   void set_display_name(const std::u16string_view value) {
