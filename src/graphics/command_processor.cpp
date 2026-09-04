@@ -34,6 +34,7 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/thread.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
@@ -97,6 +98,18 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
     return ReadbackResolveMode::kFull;
   }
   return ReadbackResolveMode::kDisabled;
+}
+
+// Logs a [HOST_THREAD] line with `name` and this thread's OS id (matching the
+// [tNNNN] log prefix) when host_thread_trace is enabled. No-op (no clock/id
+// read, no formatting) when the cvar is off. Kept as a single-statement call
+// at each thread entry point so it never adds a branch to the already
+// non-trivial functions that use it.
+void LogHostThreadStart(std::string_view name) {
+  if (!REXCVAR_GET(host_thread_trace)) {
+    return;
+  }
+  REXGPU_INFO("[HOST_THREAD] name=\"{}\" tid={}", name, rex::thread::current_thread_system_id());
 }
 
 }  // namespace
@@ -206,6 +219,7 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 
 void CommandProcessor::WorkerThreadMain() {
   worker_thread_id_ = std::this_thread::get_id();
+  LogHostThreadStart("GPU Commands");
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;

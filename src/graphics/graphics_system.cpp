@@ -17,6 +17,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -27,6 +28,8 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
+#include <rex/thread.h>
+#include <rex/ui/flags.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
@@ -38,6 +41,12 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
+
+REXCVAR_DEFINE_BOOL(host_thread_trace, false, "GPU",
+                    "Log the name and OS thread id (matching the [tNNNN] log prefix) of each "
+                    "named GPU host thread when it starts, to correlate log lines with a "
+                    "specific worker")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace {
 
@@ -55,6 +64,18 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
+}
+
+// Logs a [HOST_THREAD] line with `name` and this thread's OS id (matching the
+// [tNNNN] log prefix) when host_thread_trace is enabled. No-op (no clock/id
+// read, no formatting) when the cvar is off. Kept as a single-statement call
+// at each thread entry point so it never adds a branch to the already
+// non-trivial functions that use it.
+void LogHostThreadStart(std::string_view name) {
+  if (!REXCVAR_GET(host_thread_trace)) {
+    return;
+  }
+  REXGPU_INFO("[HOST_THREAD] name=\"{}\" tid={}", name, rex::thread::current_thread_system_id());
 }
 }  // namespace
 
@@ -202,6 +223,15 @@ void GraphicsSystem::RunVsyncLoop() {
   uint64_t vsync_interval_ticks =
       std::max(uint64_t(1), uint64_t(double(kTicksPerSecond) / refresh_rate_hz));
   uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), kTicksPerSecond / 1000);
+  LogHostThreadStart("GPU VSync");
+  // One-shot, unconditional: distinguishes the host-simulated vblank
+  // timer (see the module comment above) from a real compositor/monitor
+  // refresh, and records the interval it was quantized to for this run.
+  REXGPU_INFO(
+      "[VSYNC_INIT] video_mode_refresh_rate={:.3f} effective_refresh_hz={:.3f} "
+      "vsync_interval_ticks={} vsync_cvar={}",
+      REXCVAR_GET(video_mode_refresh_rate), refresh_rate_hz, vsync_interval_ticks,
+      REXCVAR_GET(vsync));
   uint64_t last_frame_time = gpu_host_->QueryGuestTickCount();
   while (vsync_worker_running_) {
     uint64_t current_time = gpu_host_->QueryGuestTickCount();

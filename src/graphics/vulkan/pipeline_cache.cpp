@@ -59,6 +59,12 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_pipeline_creation_trace, false, "GPU/Vulkan",
+                    "Log one line per Vulkan graphics pipeline creation with its shader "
+                    "hashes, duration and creation thread id, to correlate frame-time spikes "
+                    "with pipeline compilation")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -268,6 +274,18 @@ void main() {
 }
 )";
   return source;
+}
+
+// Logs a [HOST_THREAD] line with `name` and this thread's OS id (matching the
+// [tNNNN] log prefix) when host_thread_trace is enabled. No-op (no clock/id
+// read, no formatting) when the cvar is off. Kept as a single-statement call
+// at each thread entry point so it never adds a branch to the already
+// non-trivial functions that use it.
+void LogHostThreadStart(std::string_view name) {
+  if (!REXCVAR_GET(host_thread_trace)) {
+    return;
+  }
+  REXGPU_INFO("[HOST_THREAD] name=\"{}\" tid={}", name, rex::thread::current_thread_system_id());
 }
 
 }  // namespace
@@ -669,7 +687,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       creation_threads.reserve(creation_thread_count);
       for (size_t i = 0; i < creation_thread_count; ++i) {
         std::unique_ptr<rex::thread::Thread> creation_thread =
-            rex::thread::Thread::Create({}, creation_worker);
+            rex::thread::Thread::Create({}, [creation_worker]() {
+              LogHostThreadStart("Vulkan Pipelines");
+              creation_worker();
+            });
         assert_not_null(creation_thread);
         creation_thread->set_name("Vulkan Pipelines");
         creation_threads.push_back(std::move(creation_thread));
@@ -3006,6 +3027,29 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
   return true;
 }
 
+VkResult VulkanPipelineCache::CreateGraphicsPipelineTraced(
+    const ui::vulkan::VulkanDevice::Functions& dfn, VkDevice device,
+    const VkGraphicsPipelineCreateInfo& create_info, uint64_t vertex_shader_hash,
+    uint64_t pixel_shader_hash, VkPipeline* pipeline_out) {
+  bool trace_creation = REXCVAR_GET(vulkan_pipeline_creation_trace);
+  std::chrono::steady_clock::time_point start;
+  if (trace_creation) {
+    start = std::chrono::steady_clock::now();
+  }
+  VkResult result =
+      dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &create_info, nullptr, pipeline_out);
+  if (trace_creation) {
+    double duration_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    REXGPU_INFO(
+        "[VULKAN_PIPELINE_CREATE] tid={} vs={:016X} ps={:016X} duration_ms={:.2f} result={}",
+        rex::thread::current_thread_system_id(), vertex_shader_hash, pixel_shader_hash,
+        duration_ms, int32_t(result));
+  }
+  return result;
+}
+
 bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
                                                 VkShaderModule fragment_shader_override) {
   VkPipeline existing_pipeline =
@@ -3479,19 +3523,20 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
+  uint64_t vs_hash = creation_arguments.vertex_shader->shader().ucode_data_hash();
+  uint64_t ps_hash = creation_arguments.pixel_shader
+                         ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+                         : 0;
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                                         &pipeline_create_info, nullptr, &pipeline);
+  VkResult create_result =
+      CreateGraphicsPipelineTraced(dfn, device, pipeline_create_info, vs_hash, ps_hash, &pipeline);
   if (create_result != VK_SUCCESS) {
-    uint64_t ps_hash = creation_arguments.pixel_shader
-                           ? creation_arguments.pixel_shader->shader().ucode_data_hash()
-                           : 0;
     REXGPU_ERROR(
         "VulkanPipelineCache: vkCreateGraphicsPipelines failed (result={}, vs={:016X}, "
         "ps={:016X}, topo={}, geom={}, tess_mode={}, patch_cp={}, render_pass_key=0x{:08X}, "
         "dynamic_rendering={})",
-        int32_t(create_result), creation_arguments.vertex_shader->shader().ucode_data_hash(),
-        ps_hash, uint32_t(description.primitive_topology), uint32_t(description.geometry_shader),
+        int32_t(create_result), vs_hash, ps_hash, uint32_t(description.primitive_topology),
+        uint32_t(description.geometry_shader),
         uint32_t(description.tessellation_mode),
         creation_arguments.tessellation_patch_control_points, description.render_pass_key.key,
         uint32_t(use_dynamic_rendering));
@@ -3518,6 +3563,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
 }
 
 void VulkanPipelineCache::CreationThread(size_t thread_index) {
+  LogHostThreadStart("Vulkan Pipelines");
   while (true) {
     PipelineCreationArguments creation_arguments;
     {
@@ -3623,6 +3669,7 @@ void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
 }
 
 void VulkanPipelineCache::StorageWriteThread() {
+  LogHostThreadStart("Vulkan Storage writer");
   ShaderStoredHeader shader_header;
   // Don't leak anything in unused bits.
   std::memset(&shader_header, 0, sizeof(shader_header));

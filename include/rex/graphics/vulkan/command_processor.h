@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -407,6 +408,17 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
   void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  // Blocking vkWaitForFences(..., UINT64_MAX) over the first fence_count
+  // fences in submissions_in_flight_fences_, used by
+  // CheckSubmissionFenceAndDeviceLoss. When vulkan_swap_trace is enabled,
+  // also measures how long this call blocked and accumulates it into
+  // swap_trace_fence_wait_ms_/swap_trace_fence_waits_ for the next
+  // [VULKAN_SWAP] line (see LogSwapTrace); this is the call that
+  // distinguishes a CPU-bound stall (producing PM4) from a GPU-bound one
+  // (executing PM4 already submitted). No clock is read when the cvar is
+  // off.
+  VkResult WaitForInFlightFencesBlocking(const ui::vulkan::VulkanDevice::Functions& dfn,
+                                         VkDevice device, uint32_t fence_count);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -511,6 +523,25 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool device_lost_ = false;
 
   bool cache_clear_requested_ = false;
+
+  // Vulkan swap trace (see the vulkan_swap_trace cvar): accumulates the wall
+  // time spent blocking on vkWaitForFences since the previous [VULKAN_SWAP]
+  // line, and how many of those waits were non-zero. Only the GPU Commands
+  // thread reads or writes these fields, so plain members are sufficient
+  // (see CheckSubmissionFenceAndDeviceLoss and LogSwapTrace). Reset every
+  // time a swap is logged; left untouched (and unread) while the cvar is
+  // off, keeping the traced path at zero cost when disabled.
+  double swap_trace_fence_wait_ms_ = 0.0;
+  uint32_t swap_trace_fence_waits_ = 0;
+  uint64_t swap_trace_index_ = 0;
+  std::chrono::steady_clock::time_point swap_trace_last_swap_time_;
+  bool swap_trace_has_previous_swap_ = false;
+
+  // Logs the [VULKAN_SWAP] trace line for the swap just processed by
+  // IssueSwap, if vulkan_swap_trace is enabled, and resets the per-swap fence
+  // wait accumulators above. No-op (no clock read, no formatting) when the
+  // cvar is off.
+  void LogSwapTrace(bool presented);
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index

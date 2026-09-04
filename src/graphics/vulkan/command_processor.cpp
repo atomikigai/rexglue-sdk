@@ -78,6 +78,12 @@ REXCVAR_DEFINE_BOOL(vulkan_present_timing_trace, false, "GPU/Vulkan",
                     "Log one-second Vulkan presentation timing summaries")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vulkan_swap_trace, false, "GPU/Vulkan",
+                    "Log one line per Vulkan swap with the gap since the previous swap and "
+                    "the time spent this interval blocked on GPU submission fences, to "
+                    "distinguish a CPU-bound stall (large gap, ~zero fence wait) from a "
+                    "GPU-bound stall (large gap, large fence wait)");
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -2320,6 +2326,26 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+void VulkanCommandProcessor::LogSwapTrace(bool presented) {
+  if (!REXCVAR_GET(vulkan_swap_trace)) {
+    return;
+  }
+  using Clock = std::chrono::steady_clock;
+  Clock::time_point now = Clock::now();
+  double gap_ms =
+      swap_trace_has_previous_swap_
+          ? std::chrono::duration<double, std::milli>(now - swap_trace_last_swap_time_).count()
+          : 0.0;
+  REXGPU_INFO(
+      "[VULKAN_SWAP] index={} gap_ms={:.2f} fence_wait_ms={:.2f} fence_waits={} presented={}",
+      swap_trace_index_, gap_ms, swap_trace_fence_wait_ms_, swap_trace_fence_waits_, presented);
+  ++swap_trace_index_;
+  swap_trace_last_swap_time_ = now;
+  swap_trace_has_previous_swap_ = true;
+  swap_trace_fence_wait_ms_ = 0.0;
+  swap_trace_fence_waits_ = 0;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
@@ -2352,6 +2378,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           "usage in this frame");
     }
     RecordPresentTiming(false);
+    LogSwapTrace(false);
     EndSubmission(true);
     return;
   }
@@ -2448,6 +2475,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     }
   }
   RecordPresentTiming(true);
+  LogSwapTrace(true);
   REXGPU_DEBUG(
       "XELOG_GPU PRESENT: swap_texture_view={:p} packet_size={}x{} src_size={}x{} "
       "src_unscaled={}x{} guest_output_size={}x{} format={}",
@@ -5018,6 +5046,28 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
   sample_counts->StencilFail_B = 0;
 }
 
+VkResult VulkanCommandProcessor::WaitForInFlightFencesBlocking(
+    const ui::vulkan::VulkanDevice::Functions& dfn, VkDevice device, uint32_t fence_count) {
+  bool trace_fence_wait = REXCVAR_GET(vulkan_swap_trace);
+  std::chrono::steady_clock::time_point wait_start;
+  if (trace_fence_wait) {
+    wait_start = std::chrono::steady_clock::now();
+  }
+  VkResult wait_result = dfn.vkWaitForFences(device, fence_count,
+                                             submissions_in_flight_fences_.data(), VK_TRUE,
+                                             UINT64_MAX);
+  if (trace_fence_wait) {
+    double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                wait_start)
+                         .count();
+    swap_trace_fence_wait_ms_ += wait_ms;
+    if (wait_ms > 0.0) {
+      ++swap_trace_fence_waits_;
+    }
+  }
+  return wait_result;
+}
+
 void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
@@ -5045,9 +5095,8 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    VkResult wait_result = WaitForInFlightFencesBlocking(
+        dfn, device, uint32_t(await_submission - submission_completed_));
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {

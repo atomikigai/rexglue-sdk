@@ -361,6 +361,16 @@ class VulkanPipelineCache {
       std::pair<const PipelineDescription, Pipeline>* pipeline,
       PipelineCreationArguments& creation_arguments, bool for_placeholder = false);
 
+  // Wraps vkCreateGraphicsPipelines with an optional [VULKAN_PIPELINE_CREATE]
+  // trace line (see the vulkan_pipeline_creation_trace cvar) reporting the
+  // creating thread id, shader hashes and creation duration, to correlate
+  // frame-time spikes with pipeline compilation. No clock is read and no
+  // string is formatted when the cvar is off.
+  VkResult CreateGraphicsPipelineTraced(const ui::vulkan::VulkanDevice::Functions& dfn,
+                                        VkDevice device,
+                                        const VkGraphicsPipelineCreateInfo& create_info,
+                                        uint64_t vertex_shader_hash, uint64_t pixel_shader_hash,
+                                        VkPipeline* pipeline_out);
   // Can be called from creation threads - all needed data must be fully set up
   // at the point of the call: shaders must be translated, and the pipeline
   // layout and render pass object (unless dynamic rendering is used) must be
