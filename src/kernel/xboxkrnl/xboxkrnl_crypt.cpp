@@ -17,12 +17,14 @@
 #include <memory>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/hook.h>
 #include <rex/types.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/flags.h>
 #include <rex/system/xtypes.h>
 
 #if REX_PLATFORM_WIN32
@@ -307,10 +309,16 @@ u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t>
                                    ppc_ptr_t<XECRYPT_RSA> rsa) {
   // 0 indicates failure (but not a BOOL return value)
 #if !REX_PLATFORM_WIN32
-  return XeCryptBnQwNeRsaPubCryptPortable(
+  const uint32_t result = XeCryptBnQwNeRsaPubCryptPortable(
       reinterpret_cast<const uint8_t*>(static_cast<uint64_t*>(qw_a)),
       reinterpret_cast<uint8_t*>(static_cast<uint64_t*>(qw_b)),
       reinterpret_cast<const uint8_t*>(&rsa[1]), rsa->size, rsa->public_exponent);
+  if (REXCVAR_GET(profile_settings_trace)) {
+    REXKRNL_INFO("RSA public operation: qwords={} exponent={} result={}",
+                 static_cast<uint32_t>(rsa->size), static_cast<uint32_t>(rsa->public_exponent),
+                 result);
+  }
+  return result;
 #else
   uint32_t modulus_size = rsa->size * 8;
 
