@@ -1954,7 +1954,7 @@ bool VulkanCommandProcessor::SetupContext() {
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
-  AwaitAllQueueOperationsCompletion();
+  AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllOther);
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2326,6 +2326,20 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+std::string VulkanCommandProcessor::FormatFenceWaitsByReason(
+    const std::array<uint32_t, kFenceWaitReasonLabels.size()>& waits_by_reason,
+    const std::array<double, kFenceWaitReasonLabels.size()>& wait_ms_by_reason) {
+  std::string formatted;
+  for (size_t reason = 0; reason < kFenceWaitReasonLabels.size(); ++reason) {
+    if (reason) {
+      formatted += ',';
+    }
+    formatted += fmt::format("{}:{}/{:.2f}", kFenceWaitReasonLabels[reason],
+                             waits_by_reason[reason], wait_ms_by_reason[reason]);
+  }
+  return formatted;
+}
+
 void VulkanCommandProcessor::LogSwapTrace(bool presented) {
   if (!REXCVAR_GET(vulkan_swap_trace)) {
     return;
@@ -2337,13 +2351,27 @@ void VulkanCommandProcessor::LogSwapTrace(bool presented) {
           ? std::chrono::duration<double, std::milli>(now - swap_trace_last_swap_time_).count()
           : 0.0;
   REXGPU_INFO(
-      "[VULKAN_SWAP] index={} gap_ms={:.2f} fence_wait_ms={:.2f} fence_waits={} presented={}",
-      swap_trace_index_, gap_ms, swap_trace_fence_wait_ms_, swap_trace_fence_waits_, presented);
+      "[VULKAN_SWAP] index={} gap_ms={:.2f} fence_wait_ms={:.2f} fence_waits={} presented={} "
+      "waits_by_reason={} submissions={} frame_opens={}",
+      swap_trace_index_, gap_ms, swap_trace_fence_wait_ms_, swap_trace_fence_waits_, presented,
+      FormatFenceWaitsByReason(swap_trace_fence_waits_by_reason_,
+                               swap_trace_fence_wait_ms_by_reason_),
+      swap_trace_submissions_, swap_trace_frame_opens_);
   ++swap_trace_index_;
   swap_trace_last_swap_time_ = now;
   swap_trace_has_previous_swap_ = true;
   swap_trace_fence_wait_ms_ = 0.0;
   swap_trace_fence_waits_ = 0;
+  swap_trace_fence_wait_ms_by_reason_.fill(0.0);
+  swap_trace_fence_waits_by_reason_.fill(0);
+  swap_trace_submissions_ = 0;
+  swap_trace_frame_opens_ = 0;
+}
+
+void VulkanCommandProcessor::CountSwapTraceEvent(uint32_t& counter) {
+  if (REXCVAR_GET(vulkan_swap_trace)) {
+    ++counter;
+  }
 }
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -3925,7 +3953,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     uint64_t sampler_overflow_await_submission =
         texture_cache_->GetSubmissionToAwaitOnSamplerOverflow(samplers_overflowed_count);
     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
-    CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
+    CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission,
+                                      FenceWaitReason::kSamplerOverflow);
   }
 
   uint32_t normalized_color_mask =
@@ -4325,7 +4354,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT);
 
-  if (!AwaitAllQueueOperationsCompletion()) {
+  if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllMemexport)) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
     dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
     dfn.vkFreeMemory(device, readback_memory, nullptr);
@@ -4400,7 +4429,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
     }
 
     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllMemexport)) {
         dfn.vkUnmapMemory(device, new_memory);
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
@@ -4452,7 +4481,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   readback.submission_written[write_index] = GetCurrentSubmission();
   readback.written_size[write_index] = total_size;
 
-  CheckSubmissionFenceAndDeviceLoss(0);
+  CheckSubmissionFenceAndDeviceLoss(0, FenceWaitReason::kAwaitAllMemexport);
   bool previous_slot_ready =
       readback.buffers[read_index] != VK_NULL_HANDLE &&
       readback.memories[read_index] != VK_NULL_HANDLE &&
@@ -4551,7 +4580,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
 
     if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllResolve)) {
         dfn.vkUnmapMemory(device, new_memory);
         dfn.vkDestroyBuffer(device, new_buffer, nullptr);
         dfn.vkFreeMemory(device, new_memory, nullptr);
@@ -4636,7 +4665,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
       }
       if (resolve_downscale_buffer_ != VK_NULL_HANDLE ||
           resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
-        if (!AwaitAllQueueOperationsCompletion()) {
+        if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllResolve)) {
           dfn.vkDestroyBuffer(device, new_buffer, nullptr);
           dfn.vkFreeMemory(device, new_memory, nullptr);
           return true;
@@ -4757,7 +4786,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
+  } else if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllResolve)) {
     return true;
   }
 
@@ -4767,7 +4796,7 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
                            readback.mapped_data[read_index] == nullptr)) {
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllResolve)) {
       return true;
     }
   }
@@ -4989,7 +5018,7 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   if (!EndSubmission(false)) {
     return false;
   }
-  if (!AwaitAllQueueOperationsCompletion()) {
+  if (!AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllOcclusion)) {
     return false;
   }
 
@@ -5047,7 +5076,8 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
 }
 
 VkResult VulkanCommandProcessor::WaitForInFlightFencesBlocking(
-    const ui::vulkan::VulkanDevice::Functions& dfn, VkDevice device, uint32_t fence_count) {
+    const ui::vulkan::VulkanDevice::Functions& dfn, VkDevice device, uint32_t fence_count,
+    FenceWaitReason reason) {
   bool trace_fence_wait = REXCVAR_GET(vulkan_swap_trace);
   std::chrono::steady_clock::time_point wait_start;
   if (trace_fence_wait) {
@@ -5061,14 +5091,17 @@ VkResult VulkanCommandProcessor::WaitForInFlightFencesBlocking(
                                                                 wait_start)
                          .count();
     swap_trace_fence_wait_ms_ += wait_ms;
+    swap_trace_fence_wait_ms_by_reason_[size_t(reason)] += wait_ms;
     if (wait_ms > 0.0) {
       ++swap_trace_fence_waits_;
+      ++swap_trace_fence_waits_by_reason_[size_t(reason)];
     }
   }
   return wait_result;
 }
 
-void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission,
+                                                                FenceWaitReason reason) {
   // Only report once, no need to retry a wait that won't succeed anyway.
   if (device_lost_) {
     return;
@@ -5096,7 +5129,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // synchronization scope all commands that occur earlier in submission
     // order."
     VkResult wait_result = WaitForInFlightFencesBlocking(
-        dfn, device, uint32_t(await_submission - submission_completed_));
+        dfn, device, uint32_t(await_submission - submission_completed_), reason);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5235,12 +5268,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
-  CheckSubmissionFenceAndDeviceLoss(await_submission);
+  // await_submission is 0 (never > submission_completed_, so never actually
+  // blocking) unless is_opening_frame, so attributing this call to a frame
+  // open is accurate for every wait it actually accounts for.
+  CheckSubmissionFenceAndDeviceLoss(await_submission, FenceWaitReason::kFrameOpen);
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
 
   if (is_opening_frame) {
+    CountSwapTraceEvent(swap_trace_frame_opens_);
     // Update the completed frame index, also obtaining the actual completed
     // frame number (since the CPU may be actually less than 3 frames behind)
     // before reclaiming resources tracked with the frame number.
@@ -5566,6 +5603,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     fences_free_.pop_back();
 
     submission_open_ = false;
+    CountSwapTraceEvent(swap_trace_submissions_);
   }
 
   if (is_closing_frame) {
@@ -5576,7 +5614,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
-    if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
+    if (cache_clear_requested_ &&
+        AwaitAllQueueOperationsCompletion(FenceWaitReason::kAwaitAllOther)) {
       cache_clear_requested_ = false;
 
       DestroyScratchBuffer();

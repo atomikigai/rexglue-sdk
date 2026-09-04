@@ -404,21 +404,41 @@ class VulkanCommandProcessor : public CommandProcessor {
   // barriers aside from an incoming host write (but not outgoing host read)
   // dependency.
 
+  // Attribution for a blocking wait on in-flight submission fences (see
+  // WaitForInFlightFencesBlocking and the vulkan_swap_trace cvar). Lets the
+  // [VULKAN_SWAP] trace line break fence_wait_ms/fence_waits down by call
+  // site instead of reporting one opaque total. Declaration order matches
+  // the waits_by_reason field order in LogSwapTrace.
+  enum class FenceWaitReason : uint32_t {
+    kFrameOpen,          // BeginSubmission awaiting frame-in-flight availability.
+    kSamplerOverflow,    // Awaiting submission completion to reclaim samplers.
+    kAwaitAllMemexport,  // AwaitAllQueueOperationsCompletion from memexport readback.
+    kAwaitAllResolve,    // AwaitAllQueueOperationsCompletion from resolve readback.
+    kAwaitAllOcclusion,  // AwaitAllQueueOperationsCompletion from occlusion query readback.
+    kAwaitAllOther,      // AwaitAllQueueOperationsCompletion elsewhere (cache clear, shutdown).
+    kUnknown,            // No reason was attributed by the caller.
+    kCount,
+  };
+
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
-  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission);
+  // reason attributes a resulting blocking wait for the [VULKAN_SWAP] trace;
+  // it is ignored (and never blocks) when this call turns out not to wait.
+  void CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission,
+                                         FenceWaitReason reason = FenceWaitReason::kUnknown);
   // Blocking vkWaitForFences(..., UINT64_MAX) over the first fence_count
   // fences in submissions_in_flight_fences_, used by
   // CheckSubmissionFenceAndDeviceLoss. When vulkan_swap_trace is enabled,
   // also measures how long this call blocked and accumulates it into
-  // swap_trace_fence_wait_ms_/swap_trace_fence_waits_ for the next
-  // [VULKAN_SWAP] line (see LogSwapTrace); this is the call that
-  // distinguishes a CPU-bound stall (producing PM4) from a GPU-bound one
-  // (executing PM4 already submitted). No clock is read when the cvar is
-  // off.
+  // swap_trace_fence_wait_ms_/swap_trace_fence_waits_ and their
+  // reason-indexed breakdowns for the next [VULKAN_SWAP] line (see
+  // LogSwapTrace); this is the call that distinguishes a CPU-bound stall
+  // (producing PM4) from a GPU-bound one (executing PM4 already submitted).
+  // No clock is read when the cvar is off.
   VkResult WaitForInFlightFencesBlocking(const ui::vulkan::VulkanDevice::Functions& dfn,
-                                         VkDevice device, uint32_t fence_count);
+                                         VkDevice device, uint32_t fence_count,
+                                         FenceWaitReason reason);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -428,8 +448,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
-  bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+  bool AwaitAllQueueOperationsCompletion(
+      FenceWaitReason reason = FenceWaitReason::kAwaitAllOther) {
+    CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission(), reason);
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
@@ -536,12 +557,39 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t swap_trace_index_ = 0;
   std::chrono::steady_clock::time_point swap_trace_last_swap_time_;
   bool swap_trace_has_previous_swap_ = false;
+  // Per-FenceWaitReason breakdown of swap_trace_fence_wait_ms_/
+  // swap_trace_fence_waits_ above, kept in lockstep by
+  // WaitForInFlightFencesBlocking so the totals and the breakdown always
+  // agree; indexed with size_t(FenceWaitReason). Reset alongside the totals.
+  std::array<double, size_t(FenceWaitReason::kCount)> swap_trace_fence_wait_ms_by_reason_{};
+  std::array<uint32_t, size_t(FenceWaitReason::kCount)> swap_trace_fence_waits_by_reason_{};
+  // Number of submissions EndSubmission completed successfully (a fence was
+  // queued), and number of times BeginSubmission opened a new frame, since
+  // the previous [VULKAN_SWAP] line. Only incremented while the cvar is on.
+  uint32_t swap_trace_submissions_ = 0;
+  uint32_t swap_trace_frame_opens_ = 0;
 
   // Logs the [VULKAN_SWAP] trace line for the swap just processed by
   // IssueSwap, if vulkan_swap_trace is enabled, and resets the per-swap fence
   // wait accumulators above. No-op (no clock read, no formatting) when the
   // cvar is off.
   void LogSwapTrace(bool presented);
+  // Increments the given per-swap [VULKAN_SWAP] event counter (see
+  // swap_trace_submissions_/swap_trace_frame_opens_) if vulkan_swap_trace is
+  // enabled; a no-op otherwise, so BeginSubmission/EndSubmission don't gain
+  // extra branching to count these events when the cvar is off.
+  void CountSwapTraceEvent(uint32_t& counter);
+  // Labels for the [VULKAN_SWAP] waits_by_reason field, in FenceWaitReason
+  // declaration order.
+  static constexpr std::array<std::string_view, size_t(FenceWaitReason::kCount)>
+      kFenceWaitReasonLabels = {
+          "frame_open", "sampler", "memexport", "resolve", "occlusion", "other", "unknown",
+  };
+  // Formats the waits_by_reason=name:count/ms,... field of a [VULKAN_SWAP]
+  // line from the per-reason accumulators, in kFenceWaitReasonLabels order.
+  static std::string FormatFenceWaitsByReason(
+      const std::array<uint32_t, kFenceWaitReasonLabels.size()>& waits_by_reason,
+      const std::array<double, kFenceWaitReasonLabels.size()>& wait_ms_by_reason);
 
   // Host shader types that guest shaders can be translated into - they can
   // access the shared memory (via vertex fetch, memory export, or manual index
