@@ -84,6 +84,11 @@ REXCVAR_DEFINE_BOOL(vulkan_swap_trace, false, "GPU/Vulkan",
                     "distinguish a CPU-bound stall (large gap, ~zero fence wait) from a "
                     "GPU-bound stall (large gap, large fence wait)");
 
+REXCVAR_DEFINE_INT32(vulkan_swap_pace_vblanks, 0, "GPU/Vulkan",
+                     "Minimum simulated vblank ticks between Vulkan swaps (0 disables pacing)")
+    .range(0, 8)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -2360,11 +2365,11 @@ void VulkanCommandProcessor::LogSwapTrace(bool presented) {
           : 0.0;
   REXGPU_INFO(
       "[VULKAN_SWAP] index={} gap_ms={:.2f} fence_wait_ms={:.2f} fence_waits={} presented={} "
-      "waits_by_reason={} submissions={} frame_opens={}",
+      "waits_by_reason={} submissions={} frame_opens={} pace_wait_ms={:.2f}",
       swap_trace_index_, gap_ms, swap_trace_fence_wait_ms_, swap_trace_fence_waits_, presented,
       FormatFenceWaitsByReason(swap_trace_fence_waits_by_reason_,
                                swap_trace_fence_wait_ms_by_reason_),
-      swap_trace_submissions_, swap_trace_frame_opens_);
+      swap_trace_submissions_, swap_trace_frame_opens_, swap_trace_pace_wait_ms_);
   ++swap_trace_index_;
   swap_trace_last_swap_time_ = now;
   swap_trace_has_previous_swap_ = true;
@@ -2374,12 +2379,41 @@ void VulkanCommandProcessor::LogSwapTrace(bool presented) {
   swap_trace_fence_waits_by_reason_.fill(0);
   swap_trace_submissions_ = 0;
   swap_trace_frame_opens_ = 0;
+  swap_trace_pace_wait_ms_ = 0.0;
 }
 
 void VulkanCommandProcessor::CountSwapTraceEvent(uint32_t& counter) {
   if (REXCVAR_GET(vulkan_swap_trace)) {
     ++counter;
   }
+}
+
+double VulkanCommandProcessor::PaceSwap() {
+  uint32_t interval_vblanks = uint32_t(REXCVAR_GET(vulkan_swap_pace_vblanks));
+  if (!interval_vblanks) {
+    return 0.0;
+  }
+  if (!swap_vblank_signal_enabled_) {
+    graphics_system_->EnableSwapVblankSignal();
+    swap_vblank_signal_enabled_ = true;
+  }
+
+  uint64_t current_vblank = graphics_system_->GetSwapVblankCount();
+  uint64_t target_vblank = swap_pacer_.Schedule(current_vblank, interval_vblanks);
+  if (target_vblank <= current_vblank) {
+    return 0.0;
+  }
+
+  bool trace_wait = REXCVAR_GET(vulkan_swap_trace);
+  std::chrono::steady_clock::time_point wait_start;
+  if (trace_wait) {
+    wait_start = std::chrono::steady_clock::now();
+  }
+  graphics_system_->WaitForSwapVblank(target_vblank);
+  return trace_wait ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                                wait_start)
+                          .count()
+                    : 0.0;
 }
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -2510,6 +2544,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
           frontbuffer_width_scaled, frontbuffer_height_scaled);
     }
   }
+  swap_trace_pace_wait_ms_ = PaceSwap();
   RecordPresentTiming(true);
   LogSwapTrace(true);
   REXGPU_DEBUG(

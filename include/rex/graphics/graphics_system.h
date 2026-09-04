@@ -14,6 +14,7 @@
 #include "rex/system/function_dispatcher.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -96,6 +97,12 @@ class GraphicsSystem : public system::IGraphicsSystem {
   void Pause();
   void Resume();
 
+  // Enables the host-only vblank signal used by an opt-in swap pacer. The
+  // guest-visible vblank counter and interrupt path are unchanged.
+  void EnableSwapVblankSignal();
+  uint64_t GetSwapVblankCount() const;
+  bool WaitForSwapVblank(uint64_t target_vblank);
+
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
 
@@ -152,6 +159,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
   uint64_t mmio_range_handle_ = 0;
   std::atomic<bool> vsync_worker_running_;
   std::unique_ptr<system::IGpuHostThread> vsync_worker_thread_;
+
+  // Inactive in the default configuration. MarkVblank performs only a single
+  // flag check unless a backend explicitly enables swap pacing.
+  std::atomic<bool> swap_vblank_signal_enabled_ = false;
+  mutable std::mutex swap_vblank_mutex_;
+  std::condition_variable swap_vblank_condition_;
+  uint64_t swap_vblank_count_ = 0;
 
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

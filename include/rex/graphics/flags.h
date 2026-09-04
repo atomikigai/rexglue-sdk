@@ -81,6 +81,7 @@ REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
 REXCVAR_DECLARE(bool, vulkan_submit_on_primary_buffer_end);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
 REXCVAR_DECLARE(bool, vulkan_async_skip_incomplete_frames);
+REXCVAR_DECLARE(int32_t, vulkan_swap_pace_vblanks);
 REXCVAR_DECLARE(int32_t, vulkan_pipeline_creation_threads);
 REXCVAR_DECLARE(bool, vulkan_tessellation_wireframe);
 REXCVAR_DECLARE(bool, vulkan_force_expand_point_sprites_in_vs);

@@ -18,6 +18,7 @@ add_executable(unit_tests
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
     graphics/deferred_readback_ring_test.cpp
+    graphics/vblank_swap_pacer_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp

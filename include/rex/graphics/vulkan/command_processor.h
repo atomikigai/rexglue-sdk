@@ -29,6 +29,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/vblank_swap_pacer.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
@@ -598,6 +599,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // the previous [VULKAN_SWAP] line. Only incremented while the cvar is on.
   uint32_t swap_trace_submissions_ = 0;
   uint32_t swap_trace_frame_opens_ = 0;
+  double swap_trace_pace_wait_ms_ = 0.0;
+  VblankSwapPacer swap_pacer_;
+  bool swap_vblank_signal_enabled_ = false;
 
   // Logs the [VULKAN_SWAP] trace line for the swap just processed by
   // IssueSwap, if vulkan_swap_trace is enabled, and resets the per-swap fence
@@ -609,6 +613,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   // enabled; a no-op otherwise, so BeginSubmission/EndSubmission don't gain
   // extra branching to count these events when the cvar is off.
   void CountSwapTraceEvent(uint32_t& counter);
+  // Waits until the simulated GPU vblank selected by swap_pacer_. Returns the
+  // measured wait for the [VULKAN_SWAP] trace, or zero when pacing or tracing
+  // is disabled. The default cvar path does no clock access or waiting.
+  double PaceSwap();
   // Labels for the [VULKAN_SWAP] waits_by_reason field, in FenceWaitReason
   // declaration order.
   static constexpr std::array<std::string_view, size_t(FenceWaitReason::kCount)>

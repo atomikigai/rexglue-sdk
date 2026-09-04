@@ -388,6 +388,14 @@ void GraphicsSystem::MarkVblank() {
     command_processor_->increment_counter();
   }
 
+  if (swap_vblank_signal_enabled_.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(swap_vblank_mutex_);
+      ++swap_vblank_count_;
+    }
+    swap_vblank_condition_.notify_all();
+  }
+
   // TODO(benvanik): we shouldn't need to do the dispatch here, but there's
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
@@ -435,6 +443,25 @@ void GraphicsSystem::Pause() {
 void GraphicsSystem::Resume() {
   paused_ = false;
   command_processor_->Resume();
+}
+
+void GraphicsSystem::EnableSwapVblankSignal() {
+  std::lock_guard<std::mutex> lock(swap_vblank_mutex_);
+  swap_vblank_count_ = 0;
+  swap_vblank_signal_enabled_.store(true, std::memory_order_release);
+}
+
+uint64_t GraphicsSystem::GetSwapVblankCount() const {
+  std::lock_guard<std::mutex> lock(swap_vblank_mutex_);
+  return swap_vblank_count_;
+}
+
+bool GraphicsSystem::WaitForSwapVblank(uint64_t target_vblank) {
+  std::unique_lock<std::mutex> lock(swap_vblank_mutex_);
+  swap_vblank_condition_.wait(lock, [this, target_vblank]() {
+    return swap_vblank_count_ >= target_vblank || !vsync_worker_running_;
+  });
+  return swap_vblank_count_ >= target_vblank;
 }
 
 bool GraphicsSystem::Save(::rex::stream::ByteStream* stream) {
