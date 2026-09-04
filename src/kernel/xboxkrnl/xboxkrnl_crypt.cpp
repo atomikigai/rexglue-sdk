@@ -13,6 +13,9 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <algorithm>
+#include <limits>
+#include <memory>
+#include <vector>
 
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -26,8 +29,11 @@
 #include <windows.h>
 
 #include <bcrypt.h>
+#else
+#include <openssl/bn.h>
 #endif
 
+#include "xecrypt_rsa.h"
 #include "crypto/TinySHA1.hpp"
 #include "crypto/des/des.cpp"
 #include "crypto/des/des.h"
@@ -221,15 +227,90 @@ typedef struct {
 } XECRYPT_RSA;
 static_assert_size(XECRYPT_RSA, 0x10);
 
+#if !REX_PLATFORM_WIN32
+namespace {
+
+struct BigNumDeleter {
+  void operator()(BIGNUM* value) const { BN_free(value); }
+};
+
+struct BigNumContextDeleter {
+  void operator()(BN_CTX* value) const { BN_CTX_free(value); }
+};
+
+using UniqueBigNum = std::unique_ptr<BIGNUM, BigNumDeleter>;
+using UniqueBigNumContext = std::unique_ptr<BN_CTX, BigNumContextDeleter>;
+
+std::vector<uint8_t> XboxQwordsToBigEndian(const uint8_t* source, uint32_t num_qwords) {
+  std::vector<uint8_t> result(static_cast<size_t>(num_qwords) * sizeof(uint64_t));
+  for (uint32_t i = 0; i < num_qwords; ++i) {
+    std::memcpy(result.data() + static_cast<size_t>(i) * sizeof(uint64_t),
+                source + static_cast<size_t>(num_qwords - 1 - i) * sizeof(uint64_t),
+                sizeof(uint64_t));
+  }
+  return result;
+}
+
+void BigEndianToXboxQwords(const uint8_t* source, uint8_t* destination, uint32_t num_qwords) {
+  for (uint32_t i = 0; i < num_qwords; ++i) {
+    std::memcpy(destination + static_cast<size_t>(i) * sizeof(uint64_t),
+                source + static_cast<size_t>(num_qwords - 1 - i) * sizeof(uint64_t),
+                sizeof(uint64_t));
+  }
+}
+
+}  // namespace
+
+uint32_t XeCryptBnQwNeRsaPubCryptPortable(const uint8_t* input, uint8_t* output,
+                                          const uint8_t* modulus, uint32_t num_qwords,
+                                          uint32_t exponent) {
+  // BCrypt rejects RSA keys shorter than 512 bits. Match that behavior on
+  // non-Windows hosts instead of silently reporting success without output.
+  constexpr uint32_t kMaximumQwords =
+      static_cast<uint32_t>(std::numeric_limits<int>::max() / sizeof(uint64_t));
+  if (!input || !output || !modulus || num_qwords < 8 || num_qwords > kMaximumQwords) {
+    return 0;
+  }
+
+  const size_t modulus_size = static_cast<size_t>(num_qwords) * sizeof(uint64_t);
+  auto input_be = XboxQwordsToBigEndian(input, num_qwords);
+  auto modulus_be = XboxQwordsToBigEndian(modulus, num_qwords);
+  std::vector<uint8_t> result_be(modulus_size);
+
+  UniqueBigNum base(BN_bin2bn(input_be.data(), static_cast<int>(modulus_size), nullptr));
+  UniqueBigNum modulus_number(
+      BN_bin2bn(modulus_be.data(), static_cast<int>(modulus_size), nullptr));
+  UniqueBigNum exponent_number(BN_new());
+  UniqueBigNum result(BN_new());
+  UniqueBigNumContext context(BN_CTX_new());
+  if (!base || !modulus_number || !exponent_number || !result || !context) {
+    return 0;
+  }
+
+  if (!BN_set_word(exponent_number.get(), exponent) ||
+      !BN_mod_exp(result.get(), base.get(), exponent_number.get(), modulus_number.get(),
+                  context.get())) {
+    return 0;
+  }
+
+  if (BN_bn2binpad(result.get(), result_be.data(), static_cast<int>(modulus_size)) !=
+      static_cast<int>(modulus_size)) {
+    return 0;
+  }
+
+  BigEndianToXboxQwords(result_be.data(), output, num_qwords);
+  return 1;
+}
+#endif
+
 u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t> qw_b,
                                    ppc_ptr_t<XECRYPT_RSA> rsa) {
   // 0 indicates failure (but not a BOOL return value)
 #if !REX_PLATFORM_WIN32
-  REXKRNL_ERROR(
-      "XeCryptBnQwNeRsaPubCrypt called but no implementation available for "
-      "this platform!");
-  assert_always();
-  return 1;
+  return XeCryptBnQwNeRsaPubCryptPortable(
+      reinterpret_cast<const uint8_t*>(static_cast<uint64_t*>(qw_a)),
+      reinterpret_cast<uint8_t*>(static_cast<uint64_t*>(qw_b)),
+      reinterpret_cast<const uint8_t*>(&rsa[1]), rsa->size, rsa->public_exponent);
 #else
   uint32_t modulus_size = rsa->size * 8;
 
@@ -315,11 +396,6 @@ u32 XeCryptBnQwNeRsaPubCrypt_entry(ppc_ptr_t<uint64_t> qw_a, ppc_ptr_t<uint64_t>
   return BCRYPT_SUCCESS(status) ? 1 : 0;
 #endif
 }
-#if REX_PLATFORM_WIN32
-
-#else
-
-#endif
 
 u32 XeCryptBnDwLePkcs1Verify_entry(mapped_void hash, mapped_void sig, u32 size) {
   // BOOL return value

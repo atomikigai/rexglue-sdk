@@ -21,6 +21,10 @@ add_executable(unit_tests
     codegen/output_stamp_test.cpp
 )
 
+if(NOT WIN32)
+    target_sources(unit_tests PRIVATE kernel/xecrypt_rsa_test.cpp)
+endif()
+
 target_sources(unit_tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/ui.cpp
     ${PROJECT_SOURCE_DIR}/src/rexglue/ui/progress.cpp

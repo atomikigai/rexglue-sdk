@@ -90,6 +90,11 @@ target_link_libraries(rexruntime
         xxHash::xxhash
 )
 
+if(NOT WIN32)
+    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+    target_link_libraries(rexruntime PRIVATE OpenSSL::Crypto)
+endif()
+
 if(REXGLUE_ENABLE_TRACY)
     # TARGET_NAME is what tells install(EXPORT) this text is a target to
     # namespace. Without it the plain name survives into the installed config
