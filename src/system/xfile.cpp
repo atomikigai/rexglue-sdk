@@ -9,11 +9,14 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/filesystem/vfs.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/stream.h>
+#include <rex/string/utf8.h>
+#include <rex/system/flags.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xfile.h>
@@ -23,10 +26,78 @@
 
 namespace rex::system {
 
+namespace {
+
+// Substrings (checked case-insensitively against either the raw guest path
+// passed to NtCreateFile, or an Entry's resolved absolute_path()) that
+// identify title state expected to persist across sessions.
+constexpr std::string_view kTracedPathSubstrings[] = {
+    "cache0", "cache1", "savegame", "content", "profile",
+};
+
+// Returns the resolved host filesystem path for `entry` when it is backed by
+// real host storage, or an empty path when it is not (for example, a
+// NullDevice entry, which never touches disk).
+std::filesystem::path ResolveHostPathIfBacked(rex::filesystem::Entry* entry) {
+  if (auto* host_entry = dynamic_cast<rex::filesystem::HostPathEntry*>(entry)) {
+    return host_entry->host_path();
+  }
+  return {};
+}
+
+// Snapshot of what the close-time trace needs, captured while `entry` is
+// still guaranteed alive (a successful deferred delete erases it from its
+// parent's children before XFile::~XFile can log anything).
+struct FileLifecycleCloseTrace {
+  bool enabled = false;
+  std::string path;
+  bool wanted_delete = false;
+  std::filesystem::path host_path;
+};
+
+FileLifecycleCloseTrace CaptureFileLifecycleCloseTrace(bool traced, rex::filesystem::Entry* entry) {
+  if (!traced) {
+    return {};
+  }
+  return {true, entry->absolute_path(), entry->delete_on_close(), ResolveHostPathIfBacked(entry)};
+}
+
+// Logs the outcome of a close using plain filesystem state (does `host_path`
+// still exist?) rather than CloseFileHandle()'s return value alone: that
+// value is also true when this simply wasn't the last handle, so it cannot
+// by itself say whether a deferred delete actually ran.
+void LogFileLifecycleClose(const FileLifecycleCloseTrace& trace, uint64_t bytes_written,
+                           bool close_ok, X_HANDLE handle) {
+  if (!trace.enabled) {
+    return;
+  }
+  bool host_file_still_exists =
+      !trace.host_path.empty() && std::filesystem::exists(trace.host_path);
+  REXSYS_INFO(
+      "[file_lifecycle] close handle={:#x} path='{}' bytes_written={} delete_on_close={} "
+      "close_status={} host_file_remains={}",
+      handle, trace.path, bytes_written, trace.wanted_delete, close_ok ? "ok" : "delete_failed",
+      trace.host_path.empty() ? "n/a (no host backing)" : (host_file_still_exists ? "yes" : "no"));
+}
+
+}  // namespace
+
+bool ShouldTraceFileLifecycle(const std::string_view guest_or_absolute_path) {
+  for (const auto& needle : kTracedPathSubstrings) {
+    if (rex::string::utf8_find_first_of_case(guest_or_absolute_path, needle) !=
+        std::string_view::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 XFile::XFile(KernelState* kernel_state, rex::filesystem::File* file, bool synchronous)
     : XObject(kernel_state, kObjectType), file_(file), is_synchronous_(synchronous) {
   async_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(async_event_);
+  file_lifecycle_traced_ = REXCVAR_GET(file_lifecycle_trace) &&
+                           ShouldTraceFileLifecycle(file_->entry()->absolute_path());
   file_->entry()->OpenFileHandle();
 }
 
@@ -42,10 +113,15 @@ XFile::~XFile() {
     return;
   }
   auto entry = file_->entry();
+  auto close_trace = CaptureFileLifecycleCloseTrace(file_lifecycle_traced_, entry);
+
   file_->Destroy();
-  if (!entry->CloseFileHandle()) {
+  bool close_ok = entry->CloseFileHandle();
+  if (!close_ok) {
     REXSYS_WARN("Failed to delete file marked for deletion: {}", entry->absolute_path());
   }
+
+  LogFileLifecycleClose(close_trace, traced_bytes_written_, close_ok, handle());
 }
 
 uint64_t XFile::position() const {
@@ -276,6 +352,11 @@ X_STATUS XFile::Write(uint32_t buffer_guest_address, uint32_t buffer_length, uin
       size_t(byte_offset), &bytes_written);
   if (XSUCCEEDED(result)) {
     position_ += bytes_written;
+    if (file_lifecycle_traced_) {
+      // Accumulate rather than logging per-write: titles issue many small
+      // writes per handle, and only the running total at close is useful.
+      traced_bytes_written_ += bytes_written;
+    }
   }
 
   XIOCompletion::IONotification notify;
@@ -364,6 +445,8 @@ object_ref<XFile> XFile::Restore(KernelState* kernel_state, stream::ByteStream* 
   }
 
   file->file_ = vfs_file;
+  file->file_lifecycle_traced_ = REXCVAR_GET(file_lifecycle_trace) &&
+                                 ShouldTraceFileLifecycle(file->file_->entry()->absolute_path());
   file->file_->entry()->OpenFileHandle();
   file->position_ = position;
   file->is_synchronous_ = is_synchronous;

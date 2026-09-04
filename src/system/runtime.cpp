@@ -356,22 +356,53 @@ bool Runtime::SetupVfs() {
   file_system_->RegisterSymbolicLink("cache1:", cache1_mount);
   REXSYS_DEBUG("  Mounted {} at cache1:", cache1_root.string());
 
+  // Mount Cache0 the same way as Cache1 (see above). A file-lifecycle trace
+  // of a real campaign session (see campaign_filetrace_025_runtime.log)
+  // shows the title issuing NtCreateFile('cache0:\preferences.dat',
+  // disposition=FILE_OPEN_IF) before it ever touches cache1:\autosave.
+  // Routing Cache0 to the NullDevice let that create-if fail with
+  // STATUS_ACCESS_DENIED (NullEntry never overrides CreateEntryInternal, so
+  // any create-if under a NullDevice-backed path is rejected instead of
+  // producing a real, empty file), which stops the title's storage
+  // initialization before its save subsystem is ever reached. Giving it a
+  // real writable Cache0 mirrors the two writable cache partitions a real
+  // Xbox 360 exposes; the title still has to write its own bytes for any of
+  // this to count as progress.
+  auto cache0_root = std::filesystem::absolute(user_data_root_ / "cache0");
+  auto cache0_mount = "\\Device\\Harddisk0\\Cache0";
+  auto cache0_device =
+      std::make_unique<rex::filesystem::HostPathDevice>(cache0_mount, cache0_root, false);
+  if (!cache0_device->Initialize()) {
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to initialize cache0 host path device at {}",
+                 cache0_root.string());
+    return false;
+  }
+  if (!file_system_->RegisterDevice(std::move(cache0_device))) {
+    REXSYS_ERROR("Runtime::SetupVfs: Failed to register cache0 host path device");
+    return false;
+  }
+  file_system_->RegisterSymbolicLink("cache0:", cache0_mount);
+  REXSYS_DEBUG("  Mounted {} at cache0:", cache0_root.string());
+
   // Setup NullDevice for raw HDD partition accesses
   // Cache/STFC code baked into games tries reading/writing to these
   // Using a NullDevice returns success to all IO requests, allowing games
   // to believe cache/raw disk was accessed successfully.
-  // NOTE: Must be registered AFTER Partition1 so Partition1 requests don't
-  // go to NullDevice (VFS resolves devices in registration order)
-  auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0")};
+  // NOTE: Must be registered AFTER Partition1 (and now Cache0/Cache1) so
+  // their requests don't go to NullDevice (VFS resolves devices in
+  // registration order)
+  auto null_paths = {std::string("\\Partition0")};
   auto null_device =
       std::make_unique<rex::filesystem::NullDevice>("\\Device\\Harddisk0", null_paths);
   if (null_device->Initialize()) {
     file_system_->RegisterDevice(std::move(null_device));
-    REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\{{Partition0,Cache0}}");
+    REXSYS_DEBUG("  Registered NullDevice for \\Device\\Harddisk0\\Partition0");
   }
 
-  // Keep the generic cache: alias unregistered. Only cache1: has a confirmed
-  // title use and a dedicated writable mount.
+  // Keep the generic cache: alias unregistered. Neither the traced sessions
+  // nor the code above show any title path resolving through 'cache:'
+  // (always 'cache0:' or 'cache1:' explicitly); only cache0: and cache1:
+  // have a confirmed title use and a dedicated writable mount.
 
   return true;
 }

@@ -18,6 +18,7 @@
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/flags.h>
 #include <rex/system/info/file.h>
 #include <rex/system/info/volume.h>
 #include <rex/system/kernel_state.h>
@@ -77,6 +78,45 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
   }
   return true;
 }
+
+namespace {
+
+void TraceDispositionInformation(XFile* file, bool delete_on_close) {
+  if (!REXCVAR_GET(file_lifecycle_trace)) {
+    return;
+  }
+  auto path = file->entry()->absolute_path();
+  if (!ShouldTraceFileLifecycle(path)) {
+    return;
+  }
+  REXSYS_INFO("[file_lifecycle] XFileDispositionInformation path='{}' delete_on_close={}", path,
+              delete_on_close);
+}
+
+// Returns the pre-rename absolute_path() when this rename should be traced,
+// or an empty string otherwise. Called before XFile::Rename() moves the
+// entry, since absolute_path() reflects the destination afterward.
+std::string CaptureRenameTraceSource(XFile* file) {
+  if (!REXCVAR_GET(file_lifecycle_trace)) {
+    return {};
+  }
+  auto path = file->entry()->absolute_path();
+  if (!ShouldTraceFileLifecycle(path)) {
+    return {};
+  }
+  return path;
+}
+
+void TraceRenameInformation(const std::string& source_path, const std::string& target_path,
+                            X_STATUS result) {
+  if (source_path.empty()) {
+    return;
+  }
+  REXSYS_INFO("[file_lifecycle] XFileRenameInformation from='{}' to='{}' status={:#x}", source_path,
+              target_path, (uint32_t)result);
+}
+
+}  // namespace
 
 uint32_t GetQueryFileInfoMinimumLength(uint32_t info_class) {
   switch (info_class) {
@@ -282,6 +322,7 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
       out_length = 0;
       REXKRNL_WARN("NtSetInformationFile set deleting flag for {} on close to: {}", file->name(),
                    delete_on_close);
+      TraceDispositionInformation(file.get(), delete_on_close);
       break;
     }
     case XFilePositionInformation: {
@@ -302,8 +343,16 @@ u32 NtSetInformationFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_
         return X_STATUS_INVALID_PARAMETER;
       }
 
+      // Captured before Rename() moves the entry: absolute_path() reflects
+      // the new location afterward, and the trace filter must still see the
+      // source side of a temp -> final rename (for example, an autosave
+      // renamed out of cache1: into a non-.temp name).
+      auto rename_trace_source = CaptureRenameTraceSource(file.get());
+
       result = file->Rename(target_file_path);
       out_length = sizeof(*info);
+
+      TraceRenameInformation(rename_trace_source, target_path, result);
       break;
     }
     case XFileAllocationInformation: {

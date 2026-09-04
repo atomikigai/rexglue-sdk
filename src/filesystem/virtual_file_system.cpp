@@ -22,6 +22,16 @@ REXCVAR_DEFINE_BOOL(allow_game_relative_writes, false, "Filesystem",
 
 namespace rex::filesystem {
 
+namespace {
+
+// NT STATUS_NOT_A_DIRECTORY (0xC0000103). Not yet defined alongside its
+// counterpart X_STATUS_FILE_IS_A_DIRECTORY in include/rex/system/xtypes.h;
+// that header is outside this change's ownership, so the raw, documented
+// value is used here instead of introducing a new shared macro.
+constexpr X_STATUS kStatusNotADirectory = static_cast<X_STATUS>(0xC0000103L);
+
+}  // namespace
+
 VirtualFileSystem::VirtualFileSystem() {}
 
 VirtualFileSystem::~VirtualFileSystem() {
@@ -230,8 +240,19 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
   }
 
   if (entry) {
-    if (entry->attributes() & kFileAttributeDirectory && is_non_directory) {
+    bool entry_is_directory = (entry->attributes() & kFileAttributeDirectory) != 0;
+    if (entry_is_directory && is_non_directory) {
+      // Caller demanded a non-directory (FILE_NON_DIRECTORY_FILE) but the
+      // existing entry is a directory.
       return X_STATUS_FILE_IS_A_DIRECTORY;
+    }
+    if (!entry_is_directory && is_directory) {
+      // Caller demanded a directory (FILE_DIRECTORY_FILE) but the existing
+      // entry is a regular file. Matches NT NtCreateFile semantics: opening
+      // a plain file with FILE_DIRECTORY_FILE must fail rather than silently
+      // succeed, which previously let titles misclassify (and then delete)
+      // in-progress autosave files as bogus directory entries.
+      return kStatusNotADirectory;
     }
 
     // If the cached entry does not exist on host anymore, invalidate it.

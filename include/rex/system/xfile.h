@@ -25,6 +25,13 @@
 
 namespace rex::system {
 
+// Returns true when a guest-visible path names title state that is expected
+// to persist across sessions: the title cache slots (cache0:/cache1:),
+// savegame/content payloads, and the user profile. Used to gate the
+// low-volume file lifecycle trace (see REXCVAR file_lifecycle_trace) so it
+// never fires for the thousands of read-only opens under game:.
+bool ShouldTraceFileLifecycle(const std::string_view guest_or_absolute_path);
+
 // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_directory_information
 class X_FILE_DIRECTORY_INFORMATION {
  public:
@@ -145,6 +152,13 @@ class XFile : public XObject {
   size_t find_index_ = 0;
 
   bool is_synchronous_ = false;
+
+  // Set once at open time when file_lifecycle_trace is enabled and this
+  // file's path is state the title persists (see ShouldTraceFileLifecycle).
+  // Cached so the hot Write() path only pays for a bool check when tracing
+  // is off, instead of re-testing the cvar and re-scanning the path.
+  bool file_lifecycle_traced_ = false;
+  uint64_t traced_bytes_written_ = 0;
 };
 
 }  // namespace rex::system

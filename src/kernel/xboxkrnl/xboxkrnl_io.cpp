@@ -13,11 +13,13 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/devices/host_path_entry.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/system/flags.h>
 #include <rex/system/info/file.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>
@@ -29,8 +31,49 @@
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
 
+REXCVAR_DEFINE_BOOL(file_lifecycle_trace, false, "Kernel",
+                    "Log the lifecycle (create, accumulated write bytes, flush, rename, "
+                    "disposition, close) of title files under cache0:/cache1:/savegame/"
+                    "content/profile paths that persist state across sessions");
+
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
+
+namespace {
+
+const char* FileActionName(rex::filesystem::FileAction action) {
+  switch (action) {
+    case rex::filesystem::FileAction::kSuperseded:
+      return "Superseded";
+    case rex::filesystem::FileAction::kOpened:
+      return "Opened";
+    case rex::filesystem::FileAction::kCreated:
+      return "Created";
+    case rex::filesystem::FileAction::kOverwritten:
+      return "Overwritten";
+    case rex::filesystem::FileAction::kExists:
+      return "Exists";
+    case rex::filesystem::FileAction::kDoesNotExist:
+      return "DoesNotExist";
+    default:
+      return "Unknown";
+  }
+}
+
+// Resolves the host filesystem path backing `entry`, or an empty string when
+// `entry` is null (open failed before an Entry existed) or is not backed by
+// real host storage (for example, a NullDevice entry).
+std::string ResolveHostPathForTrace(rex::filesystem::Entry* entry) {
+  if (!entry) {
+    return "(none)";
+  }
+  if (auto* host_entry = dynamic_cast<rex::filesystem::HostPathEntry*>(entry)) {
+    return rex::path_to_utf8(host_entry->host_path());
+  }
+  return "(no host backing: " + entry->absolute_path() + ")";
+}
+
+}  // namespace
 
 struct CreateOptions {
   // https://processhacker.sourceforge.io/doc/ntioapi_8h.html
@@ -99,6 +142,29 @@ static bool IsValidPath(const std::string_view s, bool is_pattern) {
   }
   return true;
 }
+
+namespace {
+
+// disposition/create_options are logged raw (not decoded) so a session
+// capture can be cross-checked against CreateOptions/FileDisposition without
+// this trace guessing at bit meanings itself.
+void TraceNtCreateFileLifecycle(const std::string& target_path, u32 creation_disposition,
+                                u32 create_options, X_STATUS result,
+                                rex::filesystem::FileAction file_action,
+                                rex::filesystem::File* vfs_file, X_HANDLE handle) {
+  if (!REXCVAR_GET(file_lifecycle_trace) || !ShouldTraceFileLifecycle(target_path)) {
+    return;
+  }
+  auto host_path = ResolveHostPathForTrace(XSUCCEEDED(result) ? vfs_file->entry() : nullptr);
+  REXSYS_INFO(
+      "[file_lifecycle] NtCreateFile guest='{}' disposition={:#x} create_options={:#x} "
+      "directory_file={} action={} host='{}' status={:#x} handle={:#x}",
+      target_path, (uint32_t)creation_disposition, (uint32_t)create_options,
+      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0, FileActionName(file_action),
+      host_path, (uint32_t)result, handle);
+}
+
+}  // namespace
 
 u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
                        ppc_ptr_t<X_OBJECT_ATTRIBUTES> object_attrs,
@@ -173,6 +239,10 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
   }
+
+  TraceNtCreateFileLifecycle(target_path, creation_disposition, create_options, result, file_action,
+                             vfs_file, handle);
+
   return result;
 }
 
@@ -597,8 +667,30 @@ u32 NtQueryDirectoryFile_entry(u32 file_handle, u32 event_handle, u32 apc_routin
   return result;
 }
 
+namespace {
+
+// NtFlushBuffersFile is a stub: writes already went to the host file
+// synchronously in XFile::Write, so there is nothing to flush. Traced as a
+// no-op so a title relying on flush-before-close ordering shows up here
+// rather than silently vanishing from the timeline.
+void TraceNtFlushBuffersFile(u32 file_handle) {
+  if (!REXCVAR_GET(file_lifecycle_trace)) {
+    return;
+  }
+  auto file = REX_KERNEL_OBJECTS()->LookupObject<XFile>(file_handle);
+  if (!file || !ShouldTraceFileLifecycle(file->entry()->absolute_path())) {
+    return;
+  }
+  REXSYS_INFO("[file_lifecycle] NtFlushBuffersFile path='{}' (no-op, writes are synchronous)",
+              file->entry()->absolute_path());
+}
+
+}  // namespace
+
 u32 NtFlushBuffersFile_entry(u32 file_handle, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block_ptr) {
   auto result = X_STATUS_SUCCESS;
+
+  TraceNtFlushBuffersFile(file_handle);
 
   if (io_status_block_ptr) {
     io_status_block_ptr->status = result;
